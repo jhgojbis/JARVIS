@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+config.yaml
+jarvis.db
+*.egg-info/
+.pytest_cache/
+.venv/

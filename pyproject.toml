@@ -1,0 +1,23 @@
+[project]
+name = "jarvis-assistant"
+version = "0.1.0"
+description = "Personal voice assistant: screens your calls, checks email/calendar on a schedule, talk to it by phone, WhatsApp or browser."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.110", "uvicorn>=0.29", "anthropic>=0.40", "twilio>=9.0",
+  "icalendar>=5.0", "recurring-ical-events>=2.2", "python-multipart>=0.0.9", "pyyaml>=6.0",
+]
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+[project.scripts]
+jarvis = "jarvis.cli:main"
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools]
+packages = ["jarvis"]
+[tool.setuptools.package-data]
+jarvis = ["web/*.html"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

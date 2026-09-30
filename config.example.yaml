@@ -1,0 +1,41 @@
+# Copy to config.yaml (or run `jarvis setup`). Secrets go in .env, not here.
+owner:
+  name: "Boss"                 # how Jarvis refers to you
+  phone: "+15551234567"        # your real mobile (E.164) - calls get forwarded here
+  whatsapp: "+15551234567"     # where Jarvis messages you (same number is fine)
+  timezone: "America/New_York"
+  quiet_hours: ["22:00", "07:00"]   # no proactive calls/messages in this window
+
+voice:
+  # Free default: Amazon Polly voices are built into Twilio <Say>. British male = Jarvis-like.
+  twilio_voice: "Polly.Brian-Neural"
+  language: "en-GB"
+  assistant_name: "Jarvis"
+
+llm:
+  backend: "anthropic"         # anthropic | claude_cli (uses your Claude Pro/Max login via `claude -p`)
+  model: "claude-haiku-4-5-20251001"   # cheapest; ~$0.001 per call screening
+  max_tokens: 400
+  daily_token_budget: 200000   # hard stop so a bug can never burn your credits
+
+screening:
+  enabled: true
+  vip:                         # these numbers ring you directly, no questions asked
+    - {name: "Mom", number: "+15550001111"}
+  greeting: "Hello, this is {assistant}, {owner}'s assistant. Who is calling, and what is it about?"
+  block_unknown_spam: true
+  allow_urgent: true           # forward callers Claude judges genuinely urgent
+
+email:                         # IMAP works for Gmail/Outlook/iCloud/Yahoo with an app password
+  enabled: false
+  imap_host: "imap.gmail.com"
+  important_senders: []        # substrings, e.g. ["boss@company.com", "@bank.com"]
+
+calendar:
+  enabled: false
+  ics_urls: []                 # "Secret address in iCal format" from Google/Outlook/Apple calendar
+
+jobs:                          # the scheduler; you can change these by talking to Jarvis
+  - {name: email_check,     action: email_check,     every: "3h",    notify: whatsapp}
+  - {name: morning_briefing, action: briefing,        at: "08:00",   notify: call}
+  - {name: calendar_alert,  action: calendar_alert,  every: "15m",   notify: whatsapp}
