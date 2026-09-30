@@ -5,13 +5,55 @@
  - A daily token budget is enforced for every backend.
 """
 from __future__ import annotations
-import json, re, subprocess
+import atexit, json, os, re, subprocess, threading
 from .config import Config
 from .store import Store
 
 
 class BudgetExceeded(Exception):
     pass
+
+
+class WarmClaude:
+    """`claude -p` takes seconds to start, too slow for a phone call. Keep one process started ahead of time and
+    use each process for a single request (so nothing leaks between requests); the next one starts in the background.
+    MCP servers, settings/hooks, skills and tools are skipped; the real instructions travel inside the message."""
+    ARGS = ["claude", "-p", "--model", "haiku", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--system-prompt", "Follow the <instructions> in the user's message exactly.",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
+            "--disable-slash-commands", "--no-session-persistence", "--tools", ""]
+
+    def __init__(self):
+        self._lock, self._next = threading.Lock(), None
+        atexit.register(lambda: self._next and self._next.kill())
+
+    def _spawn(self) -> subprocess.Popen:
+        # Extended thinking roughly triples reply time; a phone call needs speed more than deliberation.
+        return subprocess.Popen(self.ARGS, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, bufsize=1, env={**os.environ, "MAX_THINKING_TOKENS": "0"})
+
+    def ask(self, prompt: str, timeout: float = 90) -> str:
+        with self._lock:
+            p = self._next if self._next and self._next.poll() is None else self._spawn()
+            self._next = self._spawn()
+        killer = threading.Timer(timeout, p.kill)
+        killer.start()
+        try:
+            p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
+            p.stdin.flush()
+            for line in p.stdout:
+                ev = json.loads(line)
+                if ev.get("type") == "result":
+                    if ev.get("is_error"):
+                        raise RuntimeError(f"claude CLI failed: {str(ev.get('result'))[:200]}")
+                    return str(ev.get("result") or "").strip()
+            raise RuntimeError("claude CLI exited without a result")
+        finally:
+            killer.cancel()
+            p.kill()
+
+
+_warm = WarmClaude()
 
 
 class LLM:
@@ -45,11 +87,7 @@ class LLM:
 
     def _cli(self, system, messages):
         convo = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-        r = subprocess.run(["claude", "-p", "--model", "haiku", "--append-system-prompt", system, convo],
-                           capture_output=True, text=True, timeout=90)
-        if r.returncode != 0:
-            raise RuntimeError(f"claude CLI failed: {r.stderr[:200]}")
-        return r.stdout.strip()
+        return _warm.ask(f"<instructions>\n{system}\n</instructions>\n\n{convo}")
 
     def ask_json(self, system: str, messages, max_tokens: int | None = None) -> dict:
         """Ask for a JSON object; tolerant of code fences / prose around it."""

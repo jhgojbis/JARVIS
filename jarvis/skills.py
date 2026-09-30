@@ -44,6 +44,21 @@ class Skills:
     def email_text(self, items: list[dict]) -> str:
         return "; ".join(f"{m['from'].split('<')[0].strip()}: {m['subject']}" for m in items)
 
+    def inbox_text(self, n: int = 10, snippet: int = 500) -> str:
+        """Newest mail (read or unread) with body snippets, so the owner can ask for one to be read out.
+        No LLM call; the IMAP fetch is cached for a minute so follow-up questions stay fast."""
+        if not self.cfg["email"]["enabled"]:
+            return ""
+        cached = getattr(self, "_inbox", None)
+        if not cached or time.time() - cached[0] > 60:
+            cached = self._inbox = (time.time(), mail.fetch_recent(self.cfg, limit=n, snippet=snippet))
+        return "\n".join(f"[{i + 1}]{' (unread)' if m.get('unread') else ''} From {m['from']} | Subject: {m['subject']} | "
+                         f"{m['snippet']}" for i, m in enumerate(reversed(cached[1])))
+
+    def inbox_recent(self, seconds: float = 300) -> bool:
+        """True while a conversation about email is going on, so follow-ups ("and the next one?") keep the inbox."""
+        return bool(getattr(self, "_inbox", None)) and time.time() - self._inbox[0] < seconds
+
     # ---- calendar ----------------------------------------------------------
     def calendar_text(self, hours: float = 24) -> str:
         if not self.cfg["calendar"]["enabled"]:

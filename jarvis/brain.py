@@ -7,6 +7,9 @@ from .skills import Skills
 from .store import Store
 
 SYSTEM = """You are {name}, {owner}'s personal voice assistant: concise, warm, dry British wit. Replies are SPOKEN: max 2 short sentences, no markdown.
+Exception: when asked to read or summarise an email, pick the best match from the inbox below (by sender, subject or topic, even if
+the name is approximate) and give the gist in at most 3 short sentences: who it is from, what it says, and whether anything must be
+done. Skip reference numbers, IDs, links and footers unless asked. Translate into English if it is in another language.
 You can configure yourself when asked. Put changes in "actions" (only these types):
  {{"type":"add_vip","name":str,"number":str}} | {{"type":"remove_vip","number":str}}
  {{"type":"set_job","name":str,"action":"email_check|briefing|calendar_alert","every":"3h|30m" OR "at":"HH:MM","notify":"call|message"}}
@@ -15,7 +18,7 @@ You can configure yourself when asked. Put changes in "actions" (only these type
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
-EMAIL_WORDS = re.compile(r"\b(e-?mails?|inbox|mail)\b", re.I)
+EMAIL_WORDS = re.compile(r"\b(e-?mails?|inbox|mail|read|said|says|write|writes|wrote|written|sent|messages?)\b", re.I)
 CAL_WORDS = re.compile(r"\b(calendar|schedule|meeting|meetings|today|tomorrow|agenda|busy|free)\b", re.I)
 
 
@@ -31,8 +34,8 @@ class Brain:
         ctx.append("VIPs: " + ", ".join(v["name"] for v in self.cfg["screening"]["vip"]))
         ctx.append("Jobs: " + ", ".join(f"{j['name']}({j.get('every') or 'at ' + str(j.get('at'))})" for j in self.cfg["jobs"]))
         try:
-            if EMAIL_WORDS.search(text) and self.cfg["email"]["enabled"]:
-                ctx.append("Important unread email: " + (self.skills.email_text(self.skills.important_email(False)) or "none"))
+            if (EMAIL_WORDS.search(text) or self.skills.inbox_recent()) and self.cfg["email"]["enabled"]:
+                ctx.append("Inbox, newest first:\n" + (self.skills.inbox_text() or "empty"))
             if CAL_WORDS.search(text) and self.cfg["calendar"]["enabled"]:
                 ctx.append("Calendar next 48h: " + (self.skills.calendar_text(48) or "nothing"))
         except Exception as e:

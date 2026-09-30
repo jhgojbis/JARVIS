@@ -115,6 +115,33 @@ def test_owner_voice_turn_and_goodbye(tmp_path):
     assert "Goodbye" in c.post("/voice/owner", data={"SpeechResult": "Goodbye."}).text
 
 
+def test_slow_owner_reply_holds_then_delivers(tmp_path, monkeypatch):
+    import time as _t
+    from jarvis import server
+    class SlowLLM(FakeLLM):
+        def ask_json(self, *a, **k):
+            _t.sleep(0.3)
+            return super().ask_json(*a, **k)
+    monkeypatch.setattr(server, "FAST_WAIT", 0.01)
+    _, _, _, c = make(tmp_path, llm=SlowLLM({"reply": "Invoice paid.", "actions": []}))
+    with c:
+        first = c.post("/voice/owner", data={"CallSid": "CA1", "SpeechResult": "read my email"}).text
+        assert "One moment" in first and "/voice/owner_wait" in first
+        assert "Invoice paid" in c.post("/voice/owner_wait", data={"CallSid": "CA1"}).text
+        assert "lost my train" in c.post("/voice/owner_wait", data={"CallSid": "CA1"}).text
+
+
+def test_owner_calling_in_gets_owner_mode_and_pin(tmp_path, monkeypatch):
+    _, _, _, c = make(tmp_path)
+    monkeypatch.delenv("JARVIS_PHONE_PIN", raising=False)
+    r = c.post("/voice/incoming", data={"From": "+1 555 111 2222"}).text
+    assert "/voice/owner" in r and "/voice/screen" not in r
+    monkeypatch.setenv("JARVIS_PHONE_PIN", "4711")
+    assert "/voice/owner_pin" in c.post("/voice/incoming", data={"From": "+15551112222"}).text
+    assert "/voice/owner" in c.post("/voice/owner_pin", data={"Digits": "4711"}).text
+    assert "Hangup" in c.post("/voice/owner_pin", data={"Digits": "0000"}).text
+
+
 def test_web_chat_needs_token(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_CHAT_TOKEN", "s3cret")
     _, _, _, c = make(tmp_path, llm=FakeLLM({"reply": "hello"}))

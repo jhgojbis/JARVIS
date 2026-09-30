@@ -1,6 +1,6 @@
 """FastAPI app: Twilio voice/WhatsApp webhooks + browser chat. Run with `jarvis run`."""
 from __future__ import annotations
-import asyncio, hmac, logging
+import asyncio, hmac, logging, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -17,6 +17,10 @@ from .store import Store
 
 log = logging.getLogger("jarvis")
 
+# Twilio abandons a webhook after 15 s, but the claude_cli backend can take longer. Voice replies not ready
+# within FAST_WAIT are finished in the background while Twilio polls /voice/owner_wait (each poll < HOLD_WAIT).
+FAST_WAIT, HOLD_WAIT, MAX_WAIT, SCREEN_TIMEOUT = 3.0, 9.0, 90.0, 12.0
+
 
 def xml(body: str) -> Response:
     return Response(f'<?xml version="1.0" encoding="UTF-8"?>{body}', media_type="application/xml")
@@ -30,6 +34,7 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     skills = Skills(cfg, store, llm)
     brain = Brain(cfg, store, llm, skills)
     sched = Scheduler(cfg, store, skills, notifier)
+    pending: dict[str, tuple[asyncio.Future, float]] = {}   # CallSid -> (owner reply in progress, start time)
     @asynccontextmanager
     async def lifespan(app):
         task = None if Config.env("PYTEST_CURRENT_TEST") else asyncio.create_task(sched.loop())
@@ -60,13 +65,19 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     def dial_owner(caller: str, whisper: str = "") -> str:
         num = f'<Number url="{escape(url("/voice/whisper") + "?t=" + whisper)}">{norm_number(cfg["owner"]["phone"])}</Number>' \
             if whisper else f'<Number>{norm_number(cfg["owner"]["phone"])}</Number>'
-        return f'<Dial callerId="{escape(caller)}" timeout="25" action="{url("/voice/after_dial")}">{num}</Dial>'
+        return f'<Dial callerId="{escape(caller)}" timeout="15" action="{url("/voice/after_dial")}">{num}</Dial>'
 
     # ---------------- incoming call (forward your phone to the Twilio number) ----------------
     @app.post("/voice/incoming")
     async def incoming(request: Request):
         f = await check_twilio(request)
         caller = f.get("From", "")
+        if norm_number(caller) and norm_number(caller) == norm_number(cfg["owner"]["phone"]):
+            # Caller ID can be spoofed, so a keypad PIN (JARVIS_PHONE_PIN in .env) guards owner mode when set.
+            if Config.env("JARVIS_PHONE_PIN"):
+                return xml(f'<Response><Gather input="dtmf" finishOnKey="#" timeout="8" action="{url("/voice/owner_pin")}">'
+                           f'{say("Good day. Your PIN, please.")}</Gather><Hangup/></Response>')
+            return xml(say_and_listen(cfg, f"Good day, {cfg['owner']['name']}. What can I do for you?", url("/voice/owner")))
         name = vip_name(cfg, caller)
         if name or not cfg["screening"]["enabled"]:
             store.log_call(caller, name or "", "", "vip" if name else "passthrough")
@@ -83,7 +94,11 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         if not speech.strip():
             store.log_call(caller, "", "silence", "spam")
             return xml("<Response><Hangup/></Response>")
-        r = await asyncio.get_running_loop().run_in_executor(None, classify, llm, cfg, speech)
+        try:
+            r = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, classify, llm, cfg, speech),
+                                       SCREEN_TIMEOUT)
+        except asyncio.TimeoutError:           # too slow: take a message, never connect
+            r = {"name": "", "reason": speech[:160], "verdict": "message"}
         if r["verdict"] == "connect":
             store.log_call(caller, r["name"], r["reason"], "connected")
             note = f"{r['name'] or 'Someone'} says: {r['reason']}".replace("&", "and")[:150]
@@ -123,7 +138,36 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         speech = f.get("SpeechResult", "").strip()
         if not speech or speech.lower().strip(".") in ("goodbye", "bye", "thanks", "that's all", "thank you"):
             return xml(f'<Response>{say("Very good. Goodbye.")}<Hangup/></Response>')
-        reply = await asyncio.get_running_loop().run_in_executor(None, brain.chat, "voice", speech)
+        sid = f.get("CallSid", "")
+        work = asyncio.get_running_loop().run_in_executor(None, brain.chat, "voice", speech)
+        pending[sid] = (work, time.monotonic())
+        return await owner_reply(sid, FAST_WAIT, hold="One moment, sir.")
+
+    @app.post("/voice/owner_pin")
+    async def owner_pin(request: Request):
+        f = await check_twilio(request)
+        if hmac.compare_digest(f.get("Digits", ""), Config.env("JARVIS_PHONE_PIN")):
+            return xml(say_and_listen(cfg, f"Thank you, {cfg['owner']['name']}. What can I do for you?", url("/voice/owner")))
+        return xml(f'<Response>{say("Sorry. Goodbye.")}<Hangup/></Response>')
+
+    @app.post("/voice/owner_wait")
+    async def owner_wait(request: Request):
+        f = await check_twilio(request)
+        sid = f.get("CallSid", "")
+        if sid not in pending:
+            return xml(say_and_listen(cfg, "Sorry, I lost my train of thought. What was that?", url("/voice/owner")))
+        return await owner_reply(sid, HOLD_WAIT)
+
+    async def owner_reply(sid: str, wait: float, hold: str = "") -> Response:
+        work, started = pending[sid]
+        try:
+            reply = await asyncio.wait_for(asyncio.shield(work), wait)
+        except asyncio.TimeoutError:
+            if time.monotonic() - started < MAX_WAIT:
+                return xml(f'<Response>{say(hold) if hold else ""}<Redirect method="POST">{url("/voice/owner_wait")}</Redirect></Response>')
+            pending.pop(sid, None)
+            return xml(say_and_listen(cfg, "Sorry, sir, that is taking far too long. Anything else?", url("/voice/owner")))
+        pending.pop(sid, None)
         return xml(say_and_listen(cfg, reply, url("/voice/owner")))
 
     # ---------------- WhatsApp (Twilio sandbox or approved sender) ----------------
