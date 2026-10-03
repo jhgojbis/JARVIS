@@ -1,6 +1,6 @@
 """Conversation brain: one LLM call per user turn, returns a spoken reply plus optional setup actions."""
 from __future__ import annotations
-import re
+import logging, re
 from .config import Config, norm_number
 from .llm import LLM, BudgetExceeded
 from .skills import Skills
@@ -12,19 +12,22 @@ the name is approximate) and give the gist in at most 3 short sentences: who it 
 done. Skip reference numbers, IDs, links and footers unless asked. Translate into English if it is in another language.
 You can configure yourself when asked. Put changes in "actions" (only these types):
  {{"type":"add_vip","name":str,"number":str}} | {{"type":"remove_vip","number":str}}
- {{"type":"set_job","name":str,"action":"email_check|briefing|calendar_alert","every":"3h|30m" OR "at":"HH:MM","notify":"call|message"}}
+ {{"type":"set_job","name":str,"action":"email_check|briefing|calendar_alert","every":"3h|30m" OR "at":"HH:MM","notify":"alert|call|message"}}   (alert = phone me, WhatsApp voice clip if I miss it)
  {{"type":"remove_job","name":str}} | {{"type":"add_task","text":str,"due":str}} | {{"type":"done_task","id":int}}
  {{"type":"set_screening","enabled":bool}} | {{"type":"set_quiet_hours","start":"HH:MM","end":"HH:MM"}}
+ {{"type":"send_whatsapp","text":str,"voice":bool}} = send {owner} a WhatsApp message (only ever to them). Use it when asked to send, forward or
+ WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
+log = logging.getLogger("jarvis.brain")
 EMAIL_WORDS = re.compile(r"\b(e-?mails?|inbox|mail|read|said|says|write|writes|wrote|written|sent|messages?)\b", re.I)
 CAL_WORDS = re.compile(r"\b(calendar|schedule|meeting|meetings|today|tomorrow|agenda|busy|free)\b", re.I)
 
 
 class Brain:
-    def __init__(self, cfg: Config, store: Store, llm: LLM, skills: Skills):
-        self.cfg, self.store, self.llm, self.skills = cfg, store, llm, skills
+    def __init__(self, cfg: Config, store: Store, llm: LLM, skills: Skills, notifier=None):
+        self.cfg, self.store, self.llm, self.skills, self.notifier = cfg, store, llm, skills, notifier
 
     def chat(self, channel: str, text: str) -> str:
         ctx = []
@@ -49,14 +52,16 @@ class Brain:
         except Exception:
             return "Sorry, I couldn't reach my brain just now. Try again in a moment."
         reply = str(r.get("reply") or "Sorry, I didn't catch that.")
-        self.apply(r.get("actions") or [])
+        if self.apply(r.get("actions") or []):          # an action failed: never claim it worked
+            reply = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
         self.store.add_history(channel, "user", text)
         self.store.add_history(channel, "assistant", reply)
         return reply
 
     # whitelisted config changes only - the LLM can never touch anything else
-    def apply(self, actions: list) -> None:
-        c, changed = self.cfg.data, False
+    def apply(self, actions: list) -> bool:
+        """Runs the whitelisted actions. Returns True if a WhatsApp send failed."""
+        c, changed, failed = self.cfg.data, False, False
         for a in actions if isinstance(actions, list) else []:
             if not isinstance(a, dict):
                 continue
@@ -72,7 +77,7 @@ class Brain:
                 changed = True
             elif t == "set_job" and a.get("action") in ("email_check", "briefing", "calendar_alert") and (a.get("every") or a.get("at")):
                 job = {"name": str(a.get("name") or a["action"])[:30], "action": a["action"],
-                       "notify": "call" if a.get("notify") == "call" else "message"}
+                       "notify": a["notify"] if a.get("notify") in ("call", "alert") else "message"}
                 job["every" if a.get("every") else "at"] = str(a.get("every") or a.get("at"))
                 c["jobs"] = [j for j in c["jobs"] if j["name"] != job["name"]] + [job]
                 changed = True
@@ -89,5 +94,12 @@ class Brain:
             elif t == "set_quiet_hours" and a.get("start") and a.get("end"):
                 c["owner"]["quiet_hours"] = [str(a["start"]), str(a["end"])]
                 changed = True
+            elif t == "send_whatsapp" and a.get("text") and self.notifier is not None:
+                try:
+                    (self.notifier.voice_clip if a.get("voice") is True else self.notifier.message)(str(a["text"])[:1000])
+                except Exception:
+                    log.exception("send_whatsapp failed")
+                    failed = True
         if changed:
             self.cfg.save()
+        return failed

@@ -1,11 +1,12 @@
 """FastAPI app: Twilio voice/WhatsApp webhooks + browser chat. Run with `jarvis run`."""
 from __future__ import annotations
-import asyncio, hmac, logging, time
+import asyncio, hmac, logging, re, threading, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from xml.sax.saxutils import escape
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from . import tts
 from .brain import Brain
 from .config import Config, norm_number
 from .llm import LLM
@@ -20,6 +21,9 @@ log = logging.getLogger("jarvis")
 # Twilio abandons a webhook after 15 s, but the claude_cli backend can take longer. Voice replies not ready
 # within FAST_WAIT are finished in the background while Twilio polls /voice/owner_wait (each poll < HOLD_WAIT).
 FAST_WAIT, HOLD_WAIT, MAX_WAIT, SCREEN_TIMEOUT = 3.0, 9.0, 90.0, 12.0
+PHRASES = ("Goodbye.", "One moment, sir.", "Good day. One moment while I check your mail.", "I did not hear anything. Goodbye.",
+           "One moment, let me see if they are available.", "Thank you. Goodbye.", "Very good. Goodbye.",
+           "Sorry, I lost my train of thought. What was that?", "Sorry. Goodbye.")
 
 
 def xml(body: str) -> Response:
@@ -30,14 +34,18 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
                notifier: Notifier | None = None, verify_twilio: bool | None = None) -> FastAPI:
     store = store or Store()
     llm = llm or LLM(cfg, store)
-    notifier = notifier or Notifier(cfg)
+    notifier = notifier or Notifier(cfg, store=store)
     skills = Skills(cfg, store, llm)
-    brain = Brain(cfg, store, llm, skills)
+    brain = Brain(cfg, store, llm, skills, notifier)
     sched = Scheduler(cfg, store, skills, notifier)
     pending: dict[str, tuple[asyncio.Future, float]] = {}   # CallSid -> (owner reply in progress, start time)
     @asynccontextmanager
     async def lifespan(app):
-        task = None if Config.env("PYTEST_CURRENT_TEST") else asyncio.create_task(sched.loop())
+        testing = bool(Config.env("PYTEST_CURRENT_TEST"))
+        if not testing:      # render the fixed phrases now so calls never wait for the voice
+            greeting = cfg["screening"]["greeting"].format(assistant=cfg["voice"]["assistant_name"], owner=cfg["owner"]["name"])
+            threading.Thread(target=lambda: [tts.render(cfg, t) for t in (*PHRASES, greeting)], daemon=True).start()
+        task = None if testing else asyncio.create_task(sched.loop())
         yield
         if task:
             task.cancel()
@@ -47,8 +55,7 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     verify = bool(Config.env("TWILIO_AUTH_TOKEN")) if verify_twilio is None else verify_twilio
 
     def say(text: str) -> str:
-        v = cfg["voice"]
-        return f'<Say voice="{v["twilio_voice"]}" language="{v["language"]}">{escape(text)}</Say>'
+        return tts.tag(cfg, text)
 
     def url(path: str) -> str:
         return Config.env("PUBLIC_URL").rstrip("/") + path
@@ -72,12 +79,14 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     async def incoming(request: Request):
         f = await check_twilio(request)
         caller = f.get("From", "")
+        if norm_number(caller) and norm_number(caller) == norm_number(Config.env("TWILIO_NUMBER")):
+            return xml("<Response><Hangup/></Response>")      # our own number: an unanswered alert call forwarded back to us
         if norm_number(caller) and norm_number(caller) == norm_number(cfg["owner"]["phone"]):
             # Caller ID can be spoofed, so a keypad PIN (JARVIS_PHONE_PIN in .env) guards owner mode when set.
             if Config.env("JARVIS_PHONE_PIN"):
                 return xml(f'<Response><Gather input="dtmf" finishOnKey="#" timeout="8" action="{url("/voice/owner_pin")}">'
                            f'{say("Good day. Your PIN, please.")}</Gather><Hangup/></Response>')
-            return xml(say_and_listen(cfg, f"Good day, {cfg['owner']['name']}. What can I do for you?", url("/voice/owner")))
+            return await owner_digest(f.get("CallSid", ""))
         name = vip_name(cfg, caller)
         if name or not cfg["screening"]["enabled"]:
             store.log_call(caller, name or "", "", "vip" if name else "passthrough")
@@ -147,7 +156,7 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     async def owner_pin(request: Request):
         f = await check_twilio(request)
         if hmac.compare_digest(f.get("Digits", ""), Config.env("JARVIS_PHONE_PIN")):
-            return xml(say_and_listen(cfg, f"Thank you, {cfg['owner']['name']}. What can I do for you?", url("/voice/owner")))
+            return await owner_digest(f.get("CallSid", ""))
         return xml(f'<Response>{say("Sorry. Goodbye.")}<Hangup/></Response>')
 
     @app.post("/voice/owner_wait")
@@ -157,6 +166,42 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         if sid not in pending:
             return xml(say_and_listen(cfg, "Sorry, I lost my train of thought. What was that?", url("/voice/owner")))
         return await owner_reply(sid, HOLD_WAIT)
+
+    async def owner_digest(sid: str) -> Response:
+        """First thing when the owner phones in: read the inbox, say what needs them, then listen."""
+        def run() -> str:
+            text = skills.digest()
+            store.add_history("voice", "assistant", text)
+            return text
+        pending[sid] = (asyncio.get_running_loop().run_in_executor(None, run), time.monotonic())
+        return await owner_reply(sid, FAST_WAIT, hold="Good day. One moment while I check your mail.")
+
+    @app.post("/voice/call_status")
+    async def call_status(request: Request):
+        """Twilio reports how an alert call ended; if you did not hear it, a WhatsApp voice clip goes out instead."""
+        f = await check_twilio(request)
+        try:
+            duration = int(f.get("CallDuration") or 0)
+        except ValueError:
+            duration = 0
+        await asyncio.get_running_loop().run_in_executor(
+            None, notifier.call_finished, f.get("CallSid", ""), f.get("CallStatus", ""), duration)
+        return Response(status_code=204)
+
+    @app.post("/whatsapp/status")
+    async def whatsapp_status(request: Request):
+        """Delivery receipts for what Jarvis sent: an undelivered WhatsApp message is resent as SMS."""
+        f = await check_twilio(request)
+        await asyncio.get_running_loop().run_in_executor(
+            None, notifier.whatsapp_status, f.get("MessageSid", ""), f.get("MessageStatus", ""))
+        return Response(status_code=204)
+
+    @app.get("/audio/{name}")
+    async def audio(name: str):
+        path = tts.AUDIO_DIR / name
+        if not re.fullmatch(r"[0-9a-f]{32}\.mp3", name) or not path.is_file():
+            raise HTTPException(404)
+        return FileResponse(path, media_type="audio/mpeg")
 
     async def owner_reply(sid: str, wait: float, hold: str = "") -> Response:
         work, started = pending[sid]

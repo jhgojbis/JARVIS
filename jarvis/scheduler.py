@@ -37,7 +37,10 @@ class Scheduler:
         a = job["action"]
         if a == "email_check":
             items = self.skills.important_email()
-            return ("Important email: " + self.skills.email_text(items)) if items else None
+            if not items:
+                return None
+            n = len(items)
+            return f"{self.cfg['owner']['name']}, {n} email{'s need' if n > 1 else ' needs'} you. " + self.skills.email_text(items)
         if a == "calendar_alert":
             return " | ".join(self.skills.calendar_alerts()) or None
         if a == "briefing":
@@ -58,7 +61,7 @@ class Scheduler:
                 self.store.set(key, now.timestamp())      # set first: a crash never causes a retry storm
                 text = self.run_job(job)
                 if text:
-                    self.notifier.send("call" if job.get("notify") == "call" else "message", text)
+                    self.notifier.send(job.get("notify") if job.get("notify") in ("call", "alert") else "message", text)
                     sent.append(text)
             except Exception:
                 log.exception("job %s failed", job.get("name"))
@@ -66,5 +69,8 @@ class Scheduler:
 
     async def loop(self):
         while True:
-            await asyncio.get_running_loop().run_in_executor(None, self.tick)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self.tick)
+            except Exception:       # one bad tick (e.g. a bad timezone) must never kill the scheduler for good
+                log.exception("scheduler tick failed")
             await asyncio.sleep(60)

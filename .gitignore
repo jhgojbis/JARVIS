@@ -6,3 +6,5 @@ jarvis.db
 *.egg-info/
 .pytest_cache/
 .venv/
+audio/
+models/
