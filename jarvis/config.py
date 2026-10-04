@@ -11,7 +11,7 @@ DEFAULTS = {
     # Jarvis only phones inside this window; outside it (or when you don't pick up) you get a WhatsApp voice clip instead.
     "calls": {"start": "09:00", "end": "24:00", "weekdays_only": False,
               "callback": True,
-              "sms_per_day": 6},     # cap on fallback SMS (a text message to Sweden costs about 0.65 kr per 160 characters)   # you ring Jarvis, it rejects the call (free) and rings you back (calls to a US number cost you)
+              "sms_per_day": 0},     # fallback SMS is OFF (0): a text message to Sweden costs about 0.65 kr per 160 characters   # you ring Jarvis, it rejects the call (free) and rings you back (calls to a US number cost you)
     "llm": {"backend": "anthropic", "model": "claude-haiku-4-5-20251001", "max_tokens": 400, "daily_token_budget": 200000},
     "screening": {"enabled": True, "vip": [], "block_unknown_spam": True, "allow_urgent": True,
                   "greeting": "Hello, this is {assistant}, {owner}'s assistant. Who is calling, and what is it about?"},

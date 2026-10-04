@@ -246,7 +246,7 @@ def alerts(tmp_path, monkeypatch):
     monkeypatch.setenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
     monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path / "audio")
     monkeypatch.setattr(tts, "_synth", lambda text, voice, path: path.write_bytes(b"mp3"))
-    cfg, store, _, _ = make(tmp_path, voice={"engine": "thomas"})
+    cfg, store, _, _ = make(tmp_path, voice={"engine": "thomas"}, calls={"sms_per_day": 6})     # SMS is off by default; these tests turn it on
     tw = FakeTwilio()
     return cfg, store, tw, Notifier(cfg, tw, store)
 
@@ -1013,3 +1013,16 @@ def test_sms_fallback_has_a_daily_limit(alerts):
     for _ in range(5):
         n.sms("hello")
     assert len(tw.sent) == 2
+
+
+def test_sms_is_off_by_default_so_a_failed_whatsapp_never_costs_sms_money(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUBLIC_URL", "https://j.example")
+    monkeypatch.setenv("TWILIO_NUMBER", "+15550009999")
+    monkeypatch.setenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+    cfg, store, _, _ = make(tmp_path)
+    assert cfg["calls"]["sms_per_day"] == 0
+    tw = FakeTwilio()
+    n = Notifier(cfg, tw, store)
+    n.message("Invoice due")
+    assert n.whatsapp_status("SM1", "failed") is True                  # the failure is noticed...
+    assert len(tw.sent) == 1                                           # ...but no SMS goes out

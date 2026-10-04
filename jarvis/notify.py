@@ -48,7 +48,7 @@ class Notifier:
             day, c = date.today().isoformat(), self.store.get("sms_count") or {}
             n = c.get("n", 0) if c.get("day") == day else 0
             if n >= self.cfg["calls"]["sms_per_day"]:
-                log.warning("SMS limit reached for today, not sending")
+                log.warning("SMS is off or its daily limit is reached: not sending %r", text[:60])
                 return
             self.store.set("sms_count", {"day": day, "n": n + 1})
         body = (text if len(text) <= SMS_CHARS else text[:SMS_CHARS - 3].rstrip() + "...") + (f" Listen: {media[0]}" if media else "")
