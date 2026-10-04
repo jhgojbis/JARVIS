@@ -1,6 +1,7 @@
 """Conversation brain: one LLM call per user turn, returns a spoken reply plus optional setup actions."""
 from __future__ import annotations
 import logging, re
+from . import errands
 from .config import Config, norm_number
 from .llm import LLM, BudgetExceeded
 from .skills import Skills
@@ -25,6 +26,10 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  recipient address, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
  {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
  {{"type":"discard_draft"}}
+ {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and WhatsApp {owner} the options with map and Uber Eats links.
+ Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll WhatsApp you the options in a minute." Never list places yourself.
+ {{"type":"add_favorite","item":str}} | {{"type":"remove_favorite","item":str}} = {owner}'s favourite groceries (Swedish item names, e.g. "havregryn")
+ {{"type":"send_groceries","items":[str]}} = WhatsApp {owner} Hemköp links for the items (default: all favourites). You cannot fill the cart, order or pay: say so if asked.
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
@@ -45,6 +50,9 @@ class Brain:
         draft = self.skills.pending_draft()
         if draft:
             ctx.append(f"Pending draft, NOT sent yet. To: {draft['to']} | Subject: {draft['subject']} | Text: {draft['body']}")
+        favs = self.store.get("favorites", [])
+        if favs:
+            ctx.append("Favourite groceries: " + ", ".join(favs))
         ctx.append("VIPs: " + ", ".join(v["name"] for v in self.cfg["screening"]["vip"]))
         ctx.append("Jobs: " + ", ".join(f"{j['name']}({j.get('every') or 'at ' + str(j.get('at'))})" for j in self.cfg["jobs"]))
         try:
@@ -131,6 +139,26 @@ class Brain:
                         failed = "I could not send that email. There may be no draft waiting."
             elif t == "discard_draft":
                 self.store.set("draft", None)
+            elif t == "find_places" and a.get("request") and self.notifier is not None:
+                errands.run_async(errands.places_job, self.cfg, self.notifier, str(a["request"])[:200])
+            elif t == "add_favorite" and a.get("item"):
+                favs = self.store.get("favorites", [])
+                item = str(a["item"]).strip()[:60]
+                if item and item.lower() not in [f.lower() for f in favs]:
+                    self.store.set("favorites", (favs + [item])[:100])
+            elif t == "remove_favorite" and a.get("item"):
+                self.store.set("favorites", [f for f in self.store.get("favorites", []) if f.lower() != str(a["item"]).strip().lower()])
+            elif t == "send_groceries" and self.notifier is not None:
+                given = a.get("items")
+                items = [str(i).strip()[:60] for i in given if str(i).strip()][:30] if isinstance(given, list) and given else self.store.get("favorites", [])
+                if not items:
+                    failed = "There is nothing on your grocery list yet."
+                else:
+                    try:
+                        self.notifier.message(errands.grocery_message(items))
+                    except Exception:
+                        log.exception("send_groceries failed")
+                        failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
             elif t == "trash_email" and isinstance(a.get("n"), int):
                 try:
                     log.info("trashed email: %s", self.skills.trash_inbox_item(a["n"]))

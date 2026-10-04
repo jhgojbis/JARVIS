@@ -600,3 +600,83 @@ def test_build_and_send_over_smtp(tmp_path, monkeypatch):
     assert sent[0] == ("connect", "smtp.gmail.com", 465) and sent[1] == ("login", "me@gmail.com")
     m = sent[2][1]
     assert m["To"] == "anna@x.se" and m["From"] == "me@gmail.com" and m["In-Reply-To"] == "<1>" and m.get_content().strip() == "Hej!"
+
+
+# ---------------- errands: restaurants by WhatsApp, Hemköp links, favourites ----------------
+from jarvis import errands
+
+WEB = '''Here you go: {"places":[
+ {"name":"Brödernas Kungsholmen","address":"Scheelegatan 20","why":"great burgers https://evil.example/x","ubereats":"https://www.ubereats.com/se-en/store/brodernas-kungsholmen/jLbckmL1RnW_HVEZUn2FfQ"},
+ {"name":"Pong","address":"Hornsberg","why":"cosy","ubereats":"https://evil.example/phish"},
+ {"name":"  ","address":"x"}, "junk", {"name":"Esuki Ramen","address":"Fleminggatan 1","why":"ramen","ubereats":""},
+ {"name":"Fourth","address":"y"}]}'''
+
+
+def test_places_are_parsed_and_only_whitelisted_links_survive():
+    p = errands.parse_places(WEB)
+    assert [x["name"] for x in p] == ["Brödernas Kungsholmen", "Pong"]            # at most 3 raw entries considered, junk dropped
+    assert "evil" not in p[0]["why"] and p[0]["ubereats"].startswith("https://www.ubereats.com/se-en/store/")
+    assert p[1]["ubereats"] == ""                                                  # not an Uber Eats link: dropped
+    assert errands.parse_places("no json here") == [] and errands.parse_places('{"places": 5}') == []
+
+
+def test_places_message_builds_its_own_links():
+    msg = errands.places_message("restaurant in Hornsberg", errands.parse_places(WEB))
+    assert "Ideas for: restaurant in Hornsberg" in msg and "1. Brödernas Kungsholmen - great burgers" in msg
+    assert "https://www.google.com/maps/search/?api=1&query=Br%C3%B6dernas%20Kungsholmen%20Scheelegatan%2020" in msg
+    assert "Uber Eats: no delivery page found" in msg and "evil.example" not in msg
+    assert "couldn't find anything" in errands.places_message("x", [])
+
+
+def test_grocery_message_has_one_search_link_per_item_and_is_honest():
+    msg = errands.grocery_message(["mjölk", "havregryn"])
+    assert "https://www.hemkop.se/sok?q=mj%C3%B6lk" in msg and "https://www.hemkop.se/sok?q=havregryn" in msg
+    assert "can't fill the cart" in msg
+
+
+def errand_brain(tmp_path, monkeypatch, *replies, web=WEB):
+    sent = []
+
+    class N(FakeNotifier):
+        def message(self, t, media=None): sent.append(t)
+    monkeypatch.setattr(errands, "_ask_web", lambda cfg, prompt, timeout=150: web)
+    monkeypatch.setattr(errands, "run_async", lambda fn, *a: fn(*a))              # run the background job inline
+    cfg, store, _, _ = make(tmp_path)
+    llm = FakeLLM(*replies)
+    return Brain(cfg, store, llm, Skills(cfg, store, llm), N()), store, sent
+
+
+def test_find_places_replies_at_once_and_whatsapps_the_result(tmp_path, monkeypatch):
+    b, _, sent = errand_brain(tmp_path, monkeypatch, {"reply": "On it, I'll WhatsApp you the options in a minute.",
+                                                      "actions": [{"type": "find_places", "request": "good restaurant in Hornsberg"}]})
+    assert "On it" in b.chat("voice", "find me a good restaurant in Hornsberg")
+    assert "Ideas for: good restaurant in Hornsberg" in sent[0] and "ubereats.com/se-en/store/brodernas" in sent[0]
+
+
+def test_a_failed_search_tells_you_instead_of_staying_silent(tmp_path, monkeypatch):
+    b, _, sent = errand_brain(tmp_path, monkeypatch, {"reply": "On it.", "actions": [{"type": "find_places", "request": "ramen"}]})
+    monkeypatch.setattr(errands, "_ask_web", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    b.chat("voice", "find ramen")
+    assert "failed" in sent[0]
+
+
+def test_favourites_and_grocery_links(tmp_path, monkeypatch):
+    b, store, sent = errand_brain(tmp_path, monkeypatch,
+                                  {"reply": "Added.", "actions": [{"type": "add_favorite", "item": "Havregryn"}, {"type": "add_favorite", "item": "mjölk"},
+                                                                  {"type": "add_favorite", "item": "havregryn"}]},
+                                  {"reply": "Sent.", "actions": [{"type": "send_groceries"}]},
+                                  {"reply": "Removed.", "actions": [{"type": "remove_favorite", "item": "MJÖLK"}]},
+                                  {"reply": "Sent.", "actions": [{"type": "send_groceries", "items": ["bananer"]}]})
+    b.chat("voice", "add oats and milk to my favourites")
+    assert store.get("favorites") == ["Havregryn", "mjölk"]                       # no duplicate
+    b.chat("voice", "send my grocery list")
+    assert "sok?q=Havregryn" in sent[0] and "sok?q=mj%C3%B6lk" in sent[0]
+    b.chat("voice", "remove milk")
+    assert store.get("favorites") == ["Havregryn"]
+    b.chat("voice", "send bananas")
+    assert "sok?q=bananer" in sent[1] and "Havregryn" not in sent[1]
+
+
+def test_empty_grocery_list_is_said_out_loud(tmp_path, monkeypatch):
+    b, _, sent = errand_brain(tmp_path, monkeypatch, {"reply": "Sent.", "actions": [{"type": "send_groceries"}]})
+    assert "nothing on your grocery list" in b.chat("voice", "send my groceries") and sent == []
