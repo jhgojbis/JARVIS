@@ -20,10 +20,10 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
  {{"type":"trash_email","n":int}} = move email [n] of the inbox listing below to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
  it; no confirmation needed. Pick n by sender/subject; if two emails match, ask which one instead of guessing.
- {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str}} = prepare an email, NEVER sends. Reply to inbox email [n]: give n and the
- body (to/subject are filled in). Forward [n]: n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body.
+ {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str,"account":str}} = prepare an email, NEVER sends. Reply to inbox email [n]: give n and the
+ body (to/subject/account are filled in: it leaves from the account that received it). Forward [n]: n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body, and "account" = one of the email accounts listed below (default: the first).
  Write the body in the language of the person it goes to, as {owner} would, short, signed with {owner}'s name only. After drafting, your reply MUST read out the
- recipient address, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
+ recipient address, the account it is sent from, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
  {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
  {{"type":"discard_draft"}}
  {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and WhatsApp {owner} the options with map and Uber Eats links.
@@ -56,6 +56,8 @@ class Brain:
         ctx.append("VIPs: " + ", ".join(v["name"] for v in self.cfg["screening"]["vip"]))
         ctx.append("Jobs: " + ", ".join(f"{j['name']}({j.get('every') or 'at ' + str(j.get('at'))})" for j in self.cfg["jobs"]))
         try:
+            if self.cfg["email"]["enabled"]:
+                ctx.append("Email accounts: " + (self.skills.account_names() or "none with credentials"))
             if (EMAIL_WORDS.search(text) or self.skills.inbox_recent()) and self.cfg["email"]["enabled"]:
                 ctx.append("Inbox, newest first:\n" + (self.skills.inbox_text() or "empty"))
             if CAL_WORDS.search(text) and self.cfg["calendar"]["enabled"]:

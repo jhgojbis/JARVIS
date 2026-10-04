@@ -13,6 +13,15 @@ from jarvis.server import create_app
 from jarvis.store import Store
 
 
+@pytest.fixture(autouse=True)
+def _mail_creds(monkeypatch):
+    # tests must never depend on (or reach) the real mailboxes in .env
+    monkeypatch.setenv("EMAIL_ADDRESS", "me@example.com")
+    monkeypatch.setenv("EMAIL_APP_PASSWORD", "pw")
+    for k in ("MAKLAR_EMAIL_ADDRESS", "MAKLAR_EMAIL_APP_PASSWORD"):
+        monkeypatch.delenv(k, raising=False)
+
+
 class FakeLLM:
     def __init__(self, *replies):
         self.replies, self.calls = list(replies), []
@@ -477,7 +486,7 @@ def test_trash_refuses_an_empty_id(tmp_path):
 def test_voice_trash_picks_the_numbered_email_from_the_listing(tmp_path, monkeypatch):
     import time as _t
     trashed = []
-    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid: trashed.append(mid))
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid, account=None: trashed.append(mid))
     cfg, store, _, _ = make(tmp_path, email={"enabled": True})
     llm = FakeLLM({"reply": "Done, Boss.", "actions": [{"type": "trash_email", "n": 2}]},
                   {"reply": "Done.", "actions": [{"type": "trash_email", "n": 9}]})
@@ -493,7 +502,7 @@ def test_voice_trash_picks_the_numbered_email_from_the_listing(tmp_path, monkeyp
 
 def test_voice_trash_failure_is_not_reported_as_done(tmp_path, monkeypatch):
     import time as _t
-    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid: (_ for _ in ()).throw(OSError("imap down")))
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid, account=None: (_ for _ in ()).throw(OSError("imap down")))
     cfg, store, _, _ = make(tmp_path, email={"enabled": True})
     llm = FakeLLM({"reply": "Done, Boss.", "actions": [{"type": "trash_email", "n": 1}]})
     sk = Skills(cfg, store, llm)
@@ -508,7 +517,7 @@ def mailbox(tmp_path, monkeypatch):
     out = {"sent": [], "saved": []}
     monkeypatch.setattr(mailmod, "send", lambda cfg, d: out["sent"].append(dict(d)))
     monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: out["saved"].append(dict(d)))
-    monkeypatch.setattr(mailmod, "fetch_body", lambda cfg, mid: {"from": "Anna Lind <anna@x.se>", "subject": "Faktura 4411",
+    monkeypatch.setattr(mailmod, "fetch_body", lambda cfg, mid, account=None: {"from": "Anna Lind <anna@x.se>", "subject": "Faktura 4411",
                                                                   "snippet": "Hej, fakturan förfaller fredag."})
     cfg, store, _, _ = make(tmp_path, email={"enabled": True})
     mails = [dict(MAILS[0], reply_to="anna@x.se"), dict(MAILS[1], reply_to="news@shop.com")]
@@ -680,3 +689,107 @@ def test_favourites_and_grocery_links(tmp_path, monkeypatch):
 def test_empty_grocery_list_is_said_out_loud(tmp_path, monkeypatch):
     b, _, sent = errand_brain(tmp_path, monkeypatch, {"reply": "Sent.", "actions": [{"type": "send_groceries"}]})
     assert "nothing on your grocery list" in b.chat("voice", "send my groceries") and sent == []
+
+
+# ---------------- several mailboxes (private + Maklarkontroll work mail) ----------------
+TWO = {"accounts": [{"name": "private"}, {"name": "Maklarkontroll", "env_prefix": "MAKLAR_", "priority": "high"}]}
+
+
+def two_accounts(tmp_path, monkeypatch, llm, per_account):
+    monkeypatch.setenv("MAKLAR_EMAIL_ADDRESS", "info@maklarkontroll.se")
+    monkeypatch.setenv("MAKLAR_EMAIL_APP_PASSWORD", "abcd efgh ijkl mnop")
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True, **TWO})
+
+    def getter(cfg, *a, account=None, **k):
+        r = per_account[account]
+        if isinstance(r, Exception):
+            raise r
+        return list(r)
+    monkeypatch.setattr(mailmod, "fetch_unread", getter)
+    monkeypatch.setattr(mailmod, "fetch_recent", getter)
+    return cfg, store, Skills(cfg, store, llm)
+
+
+def test_accounts_need_credentials_and_default_to_one(tmp_path, monkeypatch):
+    cfg, *_ = make(tmp_path, email={"enabled": True, **TWO})
+    assert [a["name"] for a in mailmod.accounts(cfg)] == ["private"]        # work password not set yet: skipped, nothing breaks
+    monkeypatch.setenv("MAKLAR_EMAIL_ADDRESS", "info@maklarkontroll.se")
+    monkeypatch.setenv("MAKLAR_EMAIL_APP_PASSWORD", "abcd efgh ijkl mnop")
+    a = mailmod.accounts(cfg)
+    assert [x["name"] for x in a] == ["private", "Maklarkontroll"] and a[1]["pw"] == "abcdefghijklmnop" and a[1]["priority"] == "high"
+    assert mailmod.account(cfg, "maklarkontroll")["user"] == "info@maklarkontroll.se"
+    with pytest.raises(LookupError):
+        mailmod.account(cfg, "nope")
+    cfg2, *_ = make(tmp_path)                                                # no accounts: block in config: the one from EMAIL_ADDRESS
+    assert [x["name"] for x in mailmod.accounts(cfg2)] == ["private"]
+
+
+def test_triage_covers_both_mailboxes_and_names_the_work_one(tmp_path, monkeypatch):
+    work = [{"id": "<w1>", "from": "Kund <kund@x.se>", "subject": "Visning", "snippet": "Kan vi boka en tid?", "reply_to": "kund@x.se"}]
+    priv = [{"id": "<p1>", "from": "Shop <n@shop.com>", "subject": "Sale", "snippet": "50%", "reply_to": "n@shop.com"}]
+    llm = FakeLLM({"important": [{"i": 0, "why": "customer wants a viewing"}]})
+    _, store, sk = two_accounts(tmp_path, monkeypatch, llm, {"private": priv, "Maklarkontroll": work})
+    items = sk.important_email()
+    assert [(m["account"], m["why"]) for m in items] == [("Maklarkontroll", "customer wants a viewing")]     # work mail is listed first
+    system, listing = llm.calls[0][0], llm.calls[0][1]
+    assert "Maklarkontroll is the owner's work mail" in system and listing.splitlines()[0].startswith("0|Maklarkontroll|")
+    assert sk.email_text(items) == "Maklarkontroll, Kund: customer wants a viewing"
+    assert sk.important_email() == []                                         # both accounts remembered as seen
+
+
+def test_one_broken_mailbox_does_not_hide_the_other(tmp_path, monkeypatch):
+    priv = [{"id": "<p1>", "from": "Anna <a@x.se>", "subject": "Faktura", "snippet": "x", "reply_to": "a@x.se"}]
+    _, _, sk = two_accounts(tmp_path, monkeypatch, FakeLLM({"important": [0]}), {"private": priv, "Maklarkontroll": OSError("login failed")})
+    assert [m["id"] for m in sk.important_email()] == ["<p1>"]
+    _, _, sk2 = two_accounts(tmp_path, monkeypatch, FakeLLM(), {"private": OSError("down"), "Maklarkontroll": OSError("down")})
+    assert "could not reach your email" in sk2.digest()
+
+
+def test_listing_labels_accounts_and_trash_and_reply_use_the_right_one(tmp_path, monkeypatch):
+    work = [{"id": "<w1>", "from": "Kund <kund@x.se>", "subject": "Visning", "snippet": "Kan vi boka?", "reply_to": "kund@x.se"}]
+    priv = [{"id": "<p1>", "from": "Anna <a@x.se>", "subject": "Hej", "snippet": "hej", "reply_to": "a@x.se"}]
+    out = {"trash": [], "saved": [], "sent": []}
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid, account=None: out["trash"].append((mid, account)))
+    monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: out["saved"].append(dict(d)))
+    monkeypatch.setattr(mailmod, "send", lambda cfg, d: out["sent"].append(dict(d)))
+    llm = FakeLLM({"reply": "ok", "actions": [{"type": "draft_email", "n": 1, "body": "Ja, torsdag. /Sam"}]},
+                  {"reply": "sent", "actions": [{"type": "send_email"}]},
+                  {"reply": "gone", "actions": [{"type": "trash_email", "n": 2}]})
+    cfg, store, sk = two_accounts(tmp_path, monkeypatch, llm, {"private": priv, "Maklarkontroll": work})
+    text = sk.inbox_text()
+    assert text.splitlines()[0].startswith("[1] (Maklarkontroll) From Kund") and text.splitlines()[1].startswith("[2] (private) From Anna")
+    b = Brain(cfg, store, llm, sk, None)
+    b.chat("voice", "reply to the customer")
+    assert sk.pending_draft()["account"] == "Maklarkontroll" and out["saved"][0]["account"] == "Maklarkontroll"
+    b.chat("voice", "send it")
+    assert out["sent"][0]["account"] == "Maklarkontroll" and out["sent"][0]["to"] == "kund@x.se"
+    sk._inbox = None
+    sk.inbox_text()
+    b.chat("voice", "delete the one from Anna")
+    assert out["trash"] == [("<p1>", "private")]
+
+
+def test_new_mail_picks_account_and_rejects_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: None)
+    cfg, store, sk = two_accounts(tmp_path, monkeypatch, FakeLLM(), {"private": [], "Maklarkontroll": []})
+    assert sk.make_draft({"to": "x@y.se", "subject": "Hej", "body": "text", "account": "Maklarkontroll"})["account"] == "Maklarkontroll"
+    assert sk.make_draft({"to": "x@y.se", "subject": "Hej", "body": "text"})["account"] == "private"
+    with pytest.raises(LookupError):
+        sk.make_draft({"to": "x@y.se", "subject": "Hej", "body": "text", "account": "nope"})
+
+
+def test_send_uses_the_drafts_account_over_smtp(tmp_path, monkeypatch):
+    sent = []
+
+    class SMTP:
+        def __init__(self, host, port, timeout=0): sent.append(("connect", host))
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def login(self, u, p): sent.append(("login", u, p))
+        def send_message(self, m): sent.append(("from", m["From"]))
+    monkeypatch.setenv("MAKLAR_EMAIL_ADDRESS", "info@maklarkontroll.se")
+    monkeypatch.setenv("MAKLAR_EMAIL_APP_PASSWORD", "abcd efgh ijkl mnop")
+    monkeypatch.setattr(mailmod.smtplib, "SMTP_SSL", SMTP)
+    cfg, *_ = make(tmp_path, email=TWO)
+    mailmod.send(cfg, {"to": "kund@x.se", "subject": "Re: Visning", "body": "Ja", "in_reply_to": "<w1>", "account": "Maklarkontroll"})
+    assert ("login", "info@maklarkontroll.se", "abcdefghijklmnop") in sent and ("from", "info@maklarkontroll.se") in sent

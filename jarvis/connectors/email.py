@@ -1,4 +1,6 @@
-"""Email via IMAP (works with Gmail/Outlook/iCloud/Yahoo using an app password - no OAuth needed)."""
+"""Email via IMAP/SMTP (works with Gmail/Outlook/iCloud/Yahoo using an app password - no OAuth needed).
+Several accounts are supported: config.yaml `email.accounts`, credentials in .env as <PREFIX>EMAIL_ADDRESS / <PREFIX>EMAIL_APP_PASSWORD.
+Every function takes `account=<name>`; without it the first account is used."""
 from __future__ import annotations
 import email, html, imaplib, re, smtplib, time
 from email.message import EmailMessage
@@ -12,46 +14,77 @@ def _dec(s):
     return str(make_header(decode_header(s or "")))
 
 
-def fetch_unread(cfg: Config, limit: int = 30, snippet: int = 200) -> list[dict]:
-    return _fetch(cfg, "UNSEEN", limit, snippet)
+def accounts(cfg: Config) -> list[dict]:
+    """Configured accounts that actually have credentials. No `accounts:` in the config = one account from EMAIL_ADDRESS."""
+    out = []
+    for a in cfg["email"].get("accounts") or [{"name": "private"}]:
+        prefix = a.get("env_prefix", "")
+        user, pw = Config.env(f"{prefix}EMAIL_ADDRESS"), Config.env(f"{prefix}EMAIL_APP_PASSWORD").replace(" ", "")
+        if user and pw:
+            out.append({"name": a.get("name") or "private", "user": user, "pw": pw, "priority": a.get("priority", "normal"),
+                        "imap": a.get("imap_host") or cfg["email"]["imap_host"], "smtp": a.get("smtp_host") or cfg["email"]["smtp_host"]})
+    return out
 
 
-def fetch_recent(cfg: Config, limit: int = 10, snippet: int = 500) -> list[dict]:
+def account(cfg: Config, name: str | None = None) -> dict:
+    accts = accounts(cfg)
+    if not accts:
+        raise RuntimeError("no email account has credentials (EMAIL_ADDRESS / EMAIL_APP_PASSWORD)")
+    if name:
+        for a in accts:
+            if a["name"].lower() == str(name).lower():
+                return a
+        raise LookupError(f"unknown email account {name!r}")
+    return accts[0]
+
+
+def fetch_unread(cfg: Config, limit: int = 30, snippet: int = 200, account: str | None = None) -> list[dict]:
+    return _fetch(cfg, "UNSEEN", limit, snippet, account)
+
+
+def fetch_recent(cfg: Config, limit: int = 10, snippet: int = 500, account: str | None = None) -> list[dict]:
     """Newest mail whether read or not - what the owner sees at the top of their inbox. Oldest first."""
-    return _fetch(cfg, "ALL", limit, snippet)
+    return _fetch(cfg, "ALL", limit, snippet, account)
 
 
-def _connect(cfg: Config):
-    user, pw = Config.env("EMAIL_ADDRESS"), Config.env("EMAIL_APP_PASSWORD").replace(" ", "")
-    if not (user and pw):
-        raise RuntimeError("EMAIL_ADDRESS / EMAIL_APP_PASSWORD not set")
-    M = imaplib.IMAP4_SSL(cfg["email"]["imap_host"])
-    M.login(user, pw)
+def _connect(cfg: Config, name: str | None = None):
+    a = account(cfg, name)
+    M = imaplib.IMAP4_SSL(a["imap"])
+    M.login(a["user"], a["pw"])
     return M
 
 
-def trash(cfg: Config, message_id: str) -> None:
+def _logout(M) -> None:
+    try:
+        M.logout()
+    except Exception:
+        pass
+
+
+def _find(M, message_id: str, readonly: bool) -> list:
+    M.select("INBOX", readonly=readonly)
+    _, data = M.search(None, "HEADER", "Message-ID", '"%s"' % message_id.replace('"', ""))
+    nums = data[0].split()
+    if not nums:
+        raise LookupError("message not found in the inbox")
+    return nums
+
+
+def trash(cfg: Config, message_id: str, account: str | None = None) -> None:
     """Move one message to the trash folder (Gmail keeps it 30 days; nothing is ever deleted for good).
     Found by Message-ID; the folder is whichever one the server flags \\Trash, so it works in any language."""
     if not message_id.strip("<> "):
         raise ValueError("no message id")
-    M = _connect(cfg)
+    M = _connect(cfg, account)
     try:
-        M.select("INBOX")
-        _, data = M.search(None, "HEADER", "Message-ID", '"%s"' % message_id.replace('"', ""))
-        nums = data[0].split()
-        if not nums:
-            raise LookupError("message not found in the inbox")
+        nums = _find(M, message_id, readonly=False)
         folder = _folder(M, "\\Trash")
         for n in nums:
             M.copy(n, '"%s"' % folder)
             M.store(n, "+FLAGS", "\\Deleted")
         M.expunge()
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _logout(M)
 
 
 def _folder(M, attr: str) -> str:
@@ -63,27 +96,20 @@ def _folder(M, attr: str) -> str:
     raise RuntimeError(f"no {attr} folder found")
 
 
-def fetch_body(cfg: Config, message_id: str, snippet: int = 4000) -> dict:
+def fetch_body(cfg: Config, message_id: str, snippet: int = 4000, account: str | None = None) -> dict:
     """One message in full (up to `snippet` characters of text), found by Message-ID. Never marks it read."""
-    M = _connect(cfg)
+    M = _connect(cfg, account)
     try:
-        M.select("INBOX", readonly=True)
-        _, data = M.search(None, "HEADER", "Message-ID", '"%s"' % message_id.replace('"', ""))
-        nums = data[0].split()
-        if not nums:
-            raise LookupError("message not found in the inbox")
+        nums = _find(M, message_id, readonly=True)
         _, msg = M.fetch(nums[-1], "(BODY.PEEK[])")
         return parse_message(msg[0][1], snippet)
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _logout(M)
 
 
 def build(cfg: Config, d: dict) -> EmailMessage:
     m = EmailMessage()
-    m["From"], m["To"], m["Subject"] = Config.env("EMAIL_ADDRESS"), d["to"], d["subject"]
+    m["From"], m["To"], m["Subject"] = account(cfg, d.get("account"))["user"], d["to"], d["subject"]
     m["Date"], m["Message-ID"] = formatdate(localtime=True), make_msgid()
     if d.get("in_reply_to"):
         m["In-Reply-To"] = m["References"] = d["in_reply_to"]
@@ -92,29 +118,24 @@ def build(cfg: Config, d: dict) -> EmailMessage:
 
 
 def save_draft(cfg: Config, d: dict) -> None:
-    """Put the draft into the Gmail drafts folder so it shows up on the owner's phone too."""
-    M = _connect(cfg)
+    """Put the draft into the Gmail drafts folder of the sending account, so it shows up on the owner's phone too."""
+    M = _connect(cfg, d.get("account"))
     try:
         M.append('"%s"' % _folder(M, "\\Drafts"), "\\Draft", imaplib.Time2Internaldate(time.time()), build(cfg, d).as_bytes())
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _logout(M)
 
 
 def send(cfg: Config, d: dict) -> None:
-    """Send for real over SMTP (Gmail files it under Sent by itself)."""
-    user, pw = Config.env("EMAIL_ADDRESS"), Config.env("EMAIL_APP_PASSWORD").replace(" ", "")
-    if not (user and pw):
-        raise RuntimeError("EMAIL_ADDRESS / EMAIL_APP_PASSWORD not set")
-    with smtplib.SMTP_SSL(cfg["email"]["smtp_host"], 465, timeout=30) as S:
-        S.login(user, pw)
+    """Send for real over SMTP from the draft's account (Gmail files it under Sent by itself)."""
+    a = account(cfg, d.get("account"))
+    with smtplib.SMTP_SSL(a["smtp"], 465, timeout=30) as S:
+        S.login(a["user"], a["pw"])
         S.send_message(build(cfg, d))
 
 
-def _fetch(cfg: Config, criteria: str, limit: int, snippet: int) -> list[dict]:
-    M = _connect(cfg)
+def _fetch(cfg: Config, criteria: str, limit: int, snippet: int, name: str | None = None) -> list[dict]:
+    M = _connect(cfg, name)
     try:
         M.select("INBOX", readonly=True)       # readonly: never marks mail as read
         _, data = M.search(None, criteria)
@@ -127,10 +148,7 @@ def _fetch(cfg: Config, criteria: str, limit: int, snippet: int) -> list[dict]:
             out.append(m)
         return out
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _logout(M)
 
 
 def parse_message(raw: bytes, snippet: int = 200) -> dict:

@@ -13,7 +13,7 @@ DEFAULTS = {
     "llm": {"backend": "anthropic", "model": "claude-haiku-4-5-20251001", "max_tokens": 400, "daily_token_budget": 200000},
     "screening": {"enabled": True, "vip": [], "block_unknown_spam": True, "allow_urgent": True,
                   "greeting": "Hello, this is {assistant}, {owner}'s assistant. Who is calling, and what is it about?"},
-    "email": {"enabled": False, "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com", "important_senders": []},
+    "email": {"enabled": False, "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com", "important_senders": [], "accounts": []},
     "calendar": {"enabled": False, "ics_urls": []},
     "jobs": [],
 }

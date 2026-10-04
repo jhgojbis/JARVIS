@@ -1,12 +1,15 @@
 """What Jarvis can do for you. Each skill is plain Python; the LLM is only used for judgement/wording."""
 from __future__ import annotations
-import re, threading, time
+import logging, re, threading, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from .config import Config
 from .connectors import calendar as cal, email as mail
 from .llm import LLM
 from .store import Store
+
+
+log = logging.getLogger("jarvis.skills")
 
 
 class Skills:
@@ -31,14 +34,18 @@ class Skills:
         if not self.cfg["email"]["enabled"]:
             return []
         seen = set(self.store.get("seen_mail", []))
-        new = [m for m in mail.fetch_unread(self.cfg) if not only_new or m["id"] not in seen]
+        key = lambda m: f"{m['account']}|{m['id']}"
+        new = [m for m in self._fetch_all(mail.fetch_unread) if not only_new or (key(m) not in seen and m["id"] not in seen)]
         if not new:
             return []
+        high = [a["name"] for a in self._accounts() if a["priority"] == "high"]
+        prompt = self.TRIAGE + (f" Mailbox {', '.join(high)} is the owner's work mail and matters more: treat messages from real people, "
+                                "customers, leads or inquiries there as important." if high else "")
         vip = [s.lower() for s in self.cfg["email"]["important_senders"]]
         hits = {i: "" for i, m in enumerate(new) if any(s in m["from"].lower() for s in vip)}
         try:
-            listing = "\n".join(f"{i}|{m['from']}|{m['subject']}|{m['snippet'][:160]}" for i, m in enumerate(new))
-            for it in self.llm.ask_json(self.TRIAGE, listing, 400).get("important", []):
+            listing = "\n".join(f"{i}|{m['account']}|{m['from']}|{m['subject']}|{m['snippet'][:160]}" for i, m in enumerate(new))
+            for it in self.llm.ask_json(prompt, listing, 400).get("important", []):
                 if isinstance(it, int):
                     i, why = it, ""
                 elif isinstance(it, dict):
@@ -50,11 +57,35 @@ class Skills:
         except Exception:
             pass  # budget/API trouble: fall back to sender rules only
         if mark_seen:
-            self.store.set("seen_mail", list(seen | {m["id"] for m in new})[-500:])
+            self.store.set("seen_mail", list(seen | {key(m) for m in new})[-500:])
         return [dict(new[i], why=hits[i]) for i in sorted(hits)]
 
+    def _accounts(self) -> list[dict]:
+        return mail.accounts(self.cfg)
+
+    def account_names(self) -> str:
+        return ", ".join(a["name"] + (" (work, high priority)" if a["priority"] == "high" else "") for a in self._accounts())
+
+    def _fetch_all(self, getter, **kw) -> list[dict]:
+        """Mail of every account, tagged with the account it came from. One broken account must not hide the others;
+        only when every account fails does this raise."""
+        accts, out, failed = self._accounts(), [], 0
+        if not accts:
+            raise RuntimeError("no email account has credentials")
+        for a in sorted(accts, key=lambda a: a["priority"] != "high"):          # work mail first
+            try:
+                out += [dict(m, account=a["name"]) for m in getter(self.cfg, account=a["name"], **kw)]
+            except Exception:
+                failed += 1
+                log.exception("email account %s failed", a["name"])
+        if failed == len(accts):
+            raise RuntimeError("no email account reachable")
+        return out
+
     def email_text(self, items: list[dict]) -> str:
-        return "; ".join(f"{m['from'].split('<')[0].strip()}: {m.get('why') or m['subject']}" for m in items)
+        multi = len(self._accounts()) > 1
+        return "; ".join(f"{m['account'] + ', ' if multi and m.get('account') else ''}{m['from'].split('<')[0].strip()}: "
+                         f"{m.get('why') or m['subject']}" for m in items)
 
     def _warm_inbox(self) -> None:
         try:
@@ -88,9 +119,19 @@ class Skills:
             return ""
         cached = getattr(self, "_inbox", None)
         if not cached or time.time() - cached[0] > 60:
-            cached = self._inbox = (time.time(), mail.fetch_recent(self.cfg, limit=n, snippet=snippet))
-        return "\n".join(f"[{i + 1}]{' (unread)' if m.get('unread') else ''} From {m['from']} | Subject: {m['subject']} | "
-                         f"{m['snippet']}" for i, m in enumerate(reversed(cached[1])))
+            # listing order: work account first, newest first inside each account; cached reversed so `reversed()` restores it
+            listing = []
+            fetched = self._fetch_all(mail.fetch_recent, limit=n, snippet=snippet)
+            for name in dict.fromkeys(m["account"] for m in fetched):
+                listing += list(reversed([m for m in fetched if m["account"] == name]))
+            cached = self._inbox = (time.time(), list(reversed(listing)))
+        multi = len(self._accounts()) > 1
+
+        def label(m):
+            tags = ([m["account"]] if multi and m.get("account") else []) + (["unread"] if m.get("unread") else [])
+            return f" ({', '.join(tags)})" if tags else ""
+        return "\n".join(f"[{i + 1}]{label(m)} From {m['from']} | Subject: {m['subject']} | {m['snippet']}"
+                         for i, m in enumerate(reversed(cached[1])))
 
     def trash_inbox_item(self, n: int) -> str:
         """Move email [n] of the inbox listing last read out to the trash; returns its subject."""
@@ -99,7 +140,7 @@ class Skills:
         if not 1 <= n <= len(items):
             raise LookupError("no such email in the listing")
         m = items[n - 1]
-        mail.trash(self.cfg, m["id"])
+        mail.trash(self.cfg, m["id"], account=m.get("account"))
         self._inbox = None                      # the listing has changed
         return m["subject"]
 
@@ -119,12 +160,13 @@ class Skills:
         src = items[n - 1] if isinstance(n, int) and 1 <= n <= len(items) else None
         if isinstance(n, int) and src is None:
             raise LookupError("no such email in the listing")
-        d = {"to": to, "subject": subject, "body": body, "in_reply_to": "", "ts": time.time()}
+        d = {"to": to, "subject": subject, "body": body, "in_reply_to": "", "ts": time.time(),
+             "account": mail.account(self.cfg, (src or {}).get("account") or a.get("account") or None)["name"]}   # replies leave from the account that got the mail
         if src and a.get("forward") is not True:                          # reply
             d.update(to=src["reply_to"], subject=src["subject"] if src["subject"].lower().startswith("re:") else "Re: " + src["subject"],
                      in_reply_to=src["id"])
         elif src:                                                         # forward, with the original in full
-            full = mail.fetch_body(self.cfg, src["id"])
+            full = mail.fetch_body(self.cfg, src["id"], account=src.get("account"))
             d["subject"] = src["subject"] if src["subject"].lower().startswith("fwd:") else "Fwd: " + src["subject"]
             d["body"] = f"{body}\n\n---------- Forwarded message ----------\nFrom: {full['from']}\nSubject: {full['subject']}\n\n{full['snippet']}".strip()
         if not re.fullmatch(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+", d["to"]) or not d["subject"] or not d["body"].strip():
