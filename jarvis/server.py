@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import tts
+from .telegram import Telegram, secret_for
 from .brain import Brain
 from .config import Config, norm_number
 from .llm import LLM
@@ -32,10 +33,12 @@ def xml(body: str) -> Response:
 
 
 def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
-               notifier: Notifier | None = None, verify_twilio: bool | None = None) -> FastAPI:
+               notifier: Notifier | None = None, verify_twilio: bool | None = None, telegram=None) -> FastAPI:
     store = store or Store()
     llm = llm or LLM(cfg, store)
-    notifier = notifier or Notifier(cfg, store=store)
+    tg_token = Config.env("TELEGRAM_BOT_TOKEN")
+    tg = telegram or (Telegram(tg_token) if tg_token else None)
+    notifier = notifier or Notifier(cfg, store=store, telegram=tg)
     skills = Skills(cfg, store, llm)
     brain = Brain(cfg, store, llm, skills, notifier)
     sched = Scheduler(cfg, store, skills, notifier)
@@ -46,6 +49,13 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         if not testing:      # render the fixed phrases now so calls never wait for the voice
             greeting = cfg["screening"]["greeting"].format(assistant=cfg["voice"]["assistant_name"], owner=cfg["owner"]["name"])
             threading.Thread(target=lambda: [tts.render(cfg, t) for t in (*PHRASES, greeting)], daemon=True).start()
+        if not testing and tg is not None:
+            def register():
+                try:
+                    tg.set_webhook(url("/telegram"))
+                except Exception:
+                    log.exception("could not register the Telegram webhook")
+            threading.Thread(target=register, daemon=True).start()
         task = None if testing else asyncio.create_task(sched.loop())
         yield
         if task:
@@ -180,15 +190,65 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         """First thing when the owner phones in: read the inbox, say what needs them, then listen."""
         def run() -> str:
             text, summary = skills.digest_with_summary()
-            if summary:                       # the numbered list goes to WhatsApp before Jarvis starts reading it out
+            if summary:                       # the numbered list goes to your phone before Jarvis starts reading it out
                 try:
-                    notifier.message(summary)
+                    notifier.message(summary, buttons=summary_buttons())
                 except Exception:
                     log.exception("could not send the numbered summary")
             store.add_history("voice", "assistant", text)
             return text
         pending[sid] = (asyncio.get_running_loop().run_in_executor(None, run), time.monotonic())
         return await owner_reply(sid, FAST_WAIT, hold="Good day. One moment while I check your mail.")
+
+    def summary_buttons() -> list[list[tuple[str, str]]]:
+        """Telegram buttons under the numbered summary: delete all, or one by number."""
+        n = min(skills.summary_count(), 8)
+        return ([[("Delete all", "del:all")]] + [[(f"Delete {i}", f"del:{i}") for i in range(1, n + 1)]]) if n else []
+
+    def tg_trash(which: str) -> str:
+        """Button press: deterministic, no LLM. 'all' = every item of the latest summary that is still there."""
+        items = skills.numbered()[:skills.summary_count()]
+        ns = [i for i, m in enumerate(items, 1) if not m.get("gone")] if which == "all" else [int(which)]
+        if not ns:
+            return "Nothing left to delete."
+        try:
+            names = skills.trash_inbox_items(ns)
+        except Exception:
+            log.exception("telegram delete failed")
+            return "I could not move all of those to the trash."
+        return "Moved to the trash: " + "; ".join(names)
+
+    def tg_handle(update: dict) -> None:
+        owner = int(cfg["owner"].get("telegram_chat_id") or 0)
+        cb, msg = update.get("callback_query"), update.get("message") or {}
+        sender = ((cb or msg).get("from") or {}).get("id")
+        if not owner or sender != owner:
+            return                                      # everyone but the owner is ignored, even if they find the bot
+        try:
+            if cb:
+                tg.answer_callback(cb["id"])
+                data = str(cb.get("data", ""))
+                if data == "del:all" or re.fullmatch(r"del:\d{1,2}", data):
+                    tg.send_message(owner, tg_trash(data.split(":")[1]))
+            elif str(msg.get("text", "")).strip():
+                tg.typing(owner)
+                tg.send_message(owner, brain.chat("telegram", str(msg["text"])[:1000]))
+        except Exception:
+            log.exception("telegram update failed")
+
+    @app.post("/telegram")
+    async def telegram_hook(request: Request):
+        if tg is None:
+            raise HTTPException(404)
+        if not hmac.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), secret_for(tg_token or getattr(tg, "token", ""))):
+            raise HTTPException(403, "bad telegram secret")
+        update = await request.json()
+        uid = int(update.get("update_id", 0))
+        if uid and uid <= store.get("tg_update", 0):      # Telegram retries: handle each update once
+            return {"ok": True}
+        store.set("tg_update", uid)
+        await asyncio.get_running_loop().run_in_executor(None, tg_handle, update)
+        return {"ok": True}
 
     @app.post("/voice/owner_start")
     async def owner_start(request: Request):

@@ -65,15 +65,37 @@ def doctor():
         ok(Config.env(k), k)
 
 
+def telegram_id():
+    """After you have written to your bot: shows who wrote, so you can confirm it is you before it is saved as the owner."""
+    from .config import load_dotenv
+    from .telegram import Telegram
+    load_dotenv()
+    if not Config.env("TELEGRAM_BOT_TOKEN"):
+        return print("TELEGRAM_BOT_TOKEN is not set in .env")
+    bot = Telegram(Config.env("TELEGRAM_BOT_TOKEN"))
+    bot.call("deleteWebhook")                       # getUpdates does not work while a webhook is registered
+    seen = {}
+    for u in bot.call("getUpdates"):
+        m = u.get("message") or {}
+        if m.get("from"):
+            seen[m["from"]["id"]] = (m["from"].get("first_name", ""), m["from"].get("username", ""), str(m.get("text", ""))[:40])
+    if not seen:
+        return print("No messages yet: open your bot in Telegram, press Start, write 'hi', then run this again.")
+    for uid, (first, user, text) in seen.items():
+        print(f"id={uid}  name={first}  username=@{user}  last message: {text!r}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="jarvis")
-    p.add_argument("cmd", choices=["setup", "run", "chat", "doctor"])
+    p.add_argument("cmd", choices=["setup", "run", "chat", "doctor", "telegram-id"])
     p.add_argument("--port", type=int, default=8080)
     a = p.parse_args(argv)
     if a.cmd == "setup":
         return setup()
     if a.cmd == "doctor":
         return doctor()
+    if a.cmd == "telegram-id":
+        return telegram_id()
     cfg = Config.load()
     if a.cmd == "chat":                       # text REPL, handy for testing without phone
         from .server import create_app

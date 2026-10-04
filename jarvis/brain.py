@@ -16,8 +16,8 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  {{"type":"set_job","name":str,"action":"email_check|briefing|calendar_alert","every":"3h|30m" OR "at":"HH:MM","notify":"alert|call|message"}}   (alert = phone me, WhatsApp voice clip if I miss it)
  {{"type":"remove_job","name":str}} | {{"type":"add_task","text":str,"due":str}} | {{"type":"done_task","id":int}}
  {{"type":"set_screening","enabled":bool}} | {{"type":"set_quiet_hours","start":"HH:MM","end":"HH:MM"}}
- {{"type":"send_whatsapp","text":str,"voice":bool}} = send {owner} a WhatsApp message (only ever to them). Use it when asked to send, forward or
- WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
+ {{"type":"send_message","text":str,"voice":bool}} = send {owner} a message on their phone (Telegram; only ever to them). Use it when asked to send, forward or
+ message something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
  {{"type":"trash_email","n":int}} = move numbered email [n] to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
  it; no confirmation needed. n is the [number] in the numbered list below, the same numbers as in the summary sent to WhatsApp and read out ("delete all" = every
  number of the latest summary, [1]..[N]; "delete 2" = [2]). If the owner names an email instead of a number, find it by sender/subject. One trash_email action each. If two emails match, ask which one instead of guessing.
@@ -27,10 +27,10 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  recipient address, the account it is sent from, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
  {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
  {{"type":"discard_draft"}}
- {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and WhatsApp {owner} the options with map and Uber Eats links.
- Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll WhatsApp you the options in a minute." Never list places yourself.
+ {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and message {owner} the options with map and Uber Eats links.
+ Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll message you the options in a minute." Never list places yourself.
  {{"type":"add_favorite","item":str}} | {{"type":"remove_favorite","item":str}} = {owner}'s favourite groceries (Swedish item names, e.g. "havregryn")
- {{"type":"send_groceries","items":[str]}} = WhatsApp {owner} Hemköp links for the items (default: all favourites). You cannot fill the cart, order or pay: say so if asked.
+ {{"type":"send_groceries","items":[str]}} = message {owner} Hemköp links for the items (default: all favourites). You cannot fill the cart, order or pay: say so if asked.
 Never ask which mailbox: every mailbox is already in the numbered list. When asked to check or read email, use the list; do not ask what to check.
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
@@ -122,12 +122,12 @@ class Brain:
             elif t == "set_quiet_hours" and a.get("start") and a.get("end"):
                 c["owner"]["quiet_hours"] = [str(a["start"]), str(a["end"])]
                 changed = True
-            elif t == "send_whatsapp" and a.get("text") and self.notifier is not None:
+            elif t in ("send_message", "send_whatsapp") and a.get("text") and self.notifier is not None:
                 try:
                     (self.notifier.voice_clip if a.get("voice") is True else self.notifier.message)(str(a["text"])[:1000])
                 except Exception:
-                    log.exception("send_whatsapp failed")
-                    failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
+                    log.exception("send_message failed")
+                    failed = "I tried to send that to your phone, but it was refused."
             elif t == "draft_email":
                 try:
                     self.skills.make_draft(a)
@@ -166,7 +166,7 @@ class Brain:
                         self.notifier.message(errands.grocery_message(items))
                     except Exception:
                         log.exception("send_groceries failed")
-                        failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
+                        failed = "I tried to send that to your phone, but it was refused."
             elif t == "trash_email" and isinstance(a.get("n"), int):
                 pass                                    # handled together below, so several deletions share one listing
         if trash_ns:

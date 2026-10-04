@@ -37,7 +37,7 @@ class FakeNotifier:
     def __init__(self):
         self.sent = []
 
-    def message(self, t): self.sent.append(("message", t))
+    def message(self, t, **k): self.sent.append(("message", t))
     def send(self, how, t): self.sent.append((how, t))
 
 
@@ -402,7 +402,7 @@ def test_voice_can_send_whatsapp_to_owner_only(tmp_path):
     sent = []
 
     class N(FakeNotifier):
-        def message(self, t, media=None): sent.append(("text", t))
+        def message(self, t, media=None, **k): sent.append(("text", t))
         def voice_clip(self, t): sent.append(("clip", t))
     b = brain_with(tmp_path, FakeLLM(
         {"reply": "Sent, Boss.", "actions": [{"type": "send_whatsapp", "text": "Summary: Google invoice, Apple invoice.", "to": "+15559998888"}]},
@@ -414,7 +414,7 @@ def test_voice_can_send_whatsapp_to_owner_only(tmp_path):
 
 def test_failed_whatsapp_is_not_reported_as_sent(tmp_path):
     class N(FakeNotifier):
-        def message(self, t, media=None): raise RuntimeError("63016 outside the 24h window")
+        def message(self, t, media=None, **k): raise RuntimeError("63016 outside the 24h window")
     b = brain_with(tmp_path, FakeLLM({"reply": "Sent, Boss.", "actions": [{"type": "send_whatsapp", "text": "x"}]}), N())
     r = b.chat("voice", "whatsapp me")
     assert "Sent" not in r and "refused" in r
@@ -647,7 +647,7 @@ def errand_brain(tmp_path, monkeypatch, *replies, web=WEB):
     sent = []
 
     class N(FakeNotifier):
-        def message(self, t, media=None): sent.append(t)
+        def message(self, t, media=None, **k): sent.append(t)
     monkeypatch.setattr(errands, "_ask_web", lambda cfg, prompt, timeout=150: web)
     monkeypatch.setattr(errands, "run_async", lambda fn, *a: fn(*a))              # run the background job inline
     cfg, store, _, _ = make(tmp_path)
@@ -929,7 +929,7 @@ def test_calling_in_sends_the_numbered_summary_to_whatsapp_before_reading(tmp_pa
     sent = []
 
     class N(FakeNotifier):
-        def message(self, t, media=None): sent.append(t)
+        def message(self, t, media=None, **k): sent.append(t)
     monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(SUMMARY_MAILS))
     monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, **k: list(SUMMARY_MAILS))
     cfg, _, _, _ = make(tmp_path, email={"enabled": True}, calls={"callback": False})
@@ -1026,3 +1026,109 @@ def test_sms_is_off_by_default_so_a_failed_whatsapp_never_costs_sms_money(tmp_pa
     n.message("Invoice due")
     assert n.whatsapp_status("SM1", "failed") is True                  # the failure is noticed...
     assert len(tw.sent) == 1                                           # ...but no SMS goes out
+
+
+# ---------------- Telegram: the owner's channel (free, no 24 h window) ----------------
+from jarvis import telegram as tgmod
+
+
+class FakeTelegram:
+    token = "123:ABC"
+
+    def __init__(self): self.out = []
+    def send_message(self, chat, text, buttons=None): self.out.append(("msg", chat, text, buttons))
+    def send_audio(self, chat, path, caption=""): self.out.append(("audio", chat, str(path).endswith(".mp3")))
+    def typing(self, chat): self.out.append(("typing", chat))
+    def answer_callback(self, cid): self.out.append(("ack", cid))
+    def set_webhook(self, url): self.out.append(("webhook", url))
+
+
+OWNER_TG = 4242
+
+
+def tg_app(tmp_path, llm=None, **over):
+    cfg, store, _, _ = make(tmp_path, owner={"name": "Sam", "phone": "+15551112222", "whatsapp": "+15551112222",
+                                             "telegram_chat_id": OWNER_TG}, **over)
+    tg = FakeTelegram()
+    app = create_app(cfg, store, llm or FakeLLM(), None, verify_twilio=False, telegram=tg)
+    return cfg, store, tg, TestClient(app), app
+
+
+def post(c, update, secret=None):
+    return c.post("/telegram", json=update, headers={"X-Telegram-Bot-Api-Secret-Token": secret or tgmod.secret_for("123:ABC")})
+
+
+def test_telegram_webhook_needs_the_secret(tmp_path):
+    _, _, tg, c, _ = tg_app(tmp_path)
+    assert post(c, {"update_id": 1, "message": {"from": {"id": OWNER_TG}, "text": "hi"}}, secret="wrong").status_code == 403
+    assert c.post("/telegram", json={}).status_code == 403 and tg.out == []
+
+
+def test_telegram_ignores_everyone_but_the_owner(tmp_path):
+    _, _, tg, c, _ = tg_app(tmp_path, llm=FakeLLM({"reply": "should not happen", "actions": []}))
+    assert post(c, {"update_id": 1, "message": {"from": {"id": 999}, "text": "delete all my email"}}).status_code == 200
+    assert post(c, {"update_id": 2, "callback_query": {"id": "c", "from": {"id": 999}, "data": "del:all"}}).status_code == 200
+    assert tg.out == []
+
+
+def test_telegram_owner_text_goes_through_the_brain_and_back(tmp_path):
+    _, _, tg, c, _ = tg_app(tmp_path, llm=FakeLLM({"reply": "All clear, Sam.", "actions": []}))
+    assert post(c, {"update_id": 5, "message": {"from": {"id": OWNER_TG}, "chat": {"id": OWNER_TG}, "text": "status?"}}).status_code == 200
+    assert ("msg", OWNER_TG, "All clear, Sam.", None) in tg.out and ("typing", OWNER_TG) in tg.out
+
+
+def test_telegram_retries_are_handled_once(tmp_path):
+    _, _, tg, c, _ = tg_app(tmp_path, llm=FakeLLM({"reply": "one", "actions": []}, {"reply": "two", "actions": []}))
+    u = {"update_id": 9, "message": {"from": {"id": OWNER_TG}, "text": "hi"}}
+    post(c, u)
+    post(c, u)
+    assert [o[2] for o in tg.out if o[0] == "msg"] == ["one"]
+
+
+def test_notifier_sends_everything_over_telegram_when_configured(alerts, monkeypatch):
+    cfg, store, tw, _ = alerts
+    cfg.data["owner"]["telegram_chat_id"] = OWNER_TG
+    tg = FakeTelegram()
+    n = Notifier(cfg, tw, store, telegram=tg)
+    n.message("Invoice due", buttons=[[("Delete all", "del:all")]])
+    n.voice_clip("Spoken invoice due")
+    assert tg.out[0] == ("msg", OWNER_TG, "Invoice due", [[("Delete all", "del:all")]])
+    assert ("msg", OWNER_TG, "Spoken invoice due", None) in tg.out and ("audio", OWNER_TG, True) in tg.out
+    assert tw.sent == [] and tw.made == []                                   # nothing touched Twilio messaging
+
+
+def test_without_a_telegram_chat_id_the_old_channel_is_used(alerts):
+    cfg, store, tw, _ = alerts
+    n = Notifier(cfg, tw, store, telegram=FakeTelegram())                    # token but no chat id yet
+    n.message("hello")
+    assert tw.sent and tw.sent[0]["to"].startswith("whatsapp:")
+
+
+def test_summary_goes_to_telegram_with_delete_buttons_and_buttons_delete(tmp_path, monkeypatch):
+    trashed = []
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid, account=None: trashed.append(mid))
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(SUMMARY_MAILS))
+    monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, **k: list(SUMMARY_MAILS))
+    monkeypatch.delenv("JARVIS_PHONE_PIN", raising=False)
+    llm = FakeLLM({"important": [{"i": 0, "why": "a"}, {"i": 1, "why": "b"}, {"i": 2, "why": "c"}]})
+    cfg, store, tg, c, _ = tg_app(tmp_path, llm=llm, email={"enabled": True}, calls={"callback": False})
+    with c:
+        c.post("/voice/incoming", data={"From": "+15551112222", "CallSid": "CA1"})
+    kind, chat, text, buttons = next(o for o in tg.out if o[0] == "msg")
+    assert chat == OWNER_TG and text.startswith("3 emails need you:")
+    assert buttons == [[("Delete all", "del:all")], [("Delete 1", "del:1"), ("Delete 2", "del:2"), ("Delete 3", "del:3")]]
+    post(c, {"update_id": 20, "callback_query": {"id": "cb1", "from": {"id": OWNER_TG}, "data": "del:2"}})
+    assert trashed == ["<2>"] and ("ack", "cb1") in tg.out
+    post(c, {"update_id": 21, "callback_query": {"id": "cb2", "from": {"id": OWNER_TG}, "data": "del:all"}})
+    assert trashed == ["<2>", "<1>", "<3>"]                                  # "all" skips what is already gone
+    post(c, {"update_id": 22, "callback_query": {"id": "cb3", "from": {"id": OWNER_TG}, "data": "del:all"}})
+    assert tg.out[-1][2] == "Nothing left to delete."
+
+
+def test_telegram_client_raises_on_api_errors(monkeypatch):
+    class R:
+        status_code = 400
+        def json(self): return {"ok": False, "description": "chat not found"}
+    monkeypatch.setattr(tgmod.requests, "post", lambda *a, **k: R())
+    with pytest.raises(RuntimeError, match="chat not found"):
+        tgmod.Telegram("t").send_message(1, "x")

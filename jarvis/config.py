@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 DEFAULTS = {
-    "owner": {"name": "Boss", "phone": "", "whatsapp": "", "timezone": "UTC", "quiet_hours": ["22:00", "07:00"]},
+    "owner": {"name": "Boss", "phone": "", "whatsapp": "", "telegram_chat_id": 0, "timezone": "UTC", "quiet_hours": ["22:00", "07:00"]},
     "voice": {"twilio_voice": "Polly.Brian-Neural", "language": "en-GB", "assistant_name": "Jarvis",
               "engine": "polly"},   # polly (Twilio <Say>) | thomas | luke (edge-tts, played with <Play>)
     # Jarvis only phones inside this window; outside it (or when you don't pick up) you get a WhatsApp voice clip instead.

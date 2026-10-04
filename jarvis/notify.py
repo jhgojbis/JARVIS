@@ -19,8 +19,13 @@ def can_call(cfg: Config, now: datetime) -> bool:
 
 
 class Notifier:
-    def __init__(self, cfg: Config, client=None, store=None):
-        self.cfg, self._client, self.store = cfg, client, store
+    def __init__(self, cfg: Config, client=None, store=None, telegram=None):
+        self.cfg, self._client, self.store, self.telegram = cfg, client, store, telegram
+
+    def _tg(self):
+        """(bot, chat id) when Telegram is set up: then it carries every message and voice clip instead of WhatsApp/SMS."""
+        chat = self.cfg["owner"].get("telegram_chat_id")
+        return (self.telegram, int(chat)) if self.telegram is not None and chat else None
 
     @property
     def client(self):
@@ -29,9 +34,12 @@ class Notifier:
             self._client = Client(Config.env("TWILIO_ACCOUNT_SID"), Config.env("TWILIO_AUTH_TOKEN"))
         return self._client
 
-    def message(self, text: str, media: list[str] | None = None) -> None:
+    def message(self, text: str, media: list[str] | None = None, buttons: list[list[tuple[str, str]]] | None = None) -> None:
         o = self.cfg["owner"]
-        if o.get("whatsapp"):
+        if self._tg():
+            bot, chat = self._tg()
+            bot.send_message(chat, text, buttons)           # (a voice clip is sent by voice_clip, not through `media`)
+        elif o.get("whatsapp"):
             extra = {"media_url": media} if media else {}
             base = Config.env("PUBLIC_URL").rstrip("/")
             m = self.client.messages.create(from_=Config.env("TWILIO_WHATSAPP_NUMBER"), to="whatsapp:" + norm_number(o["whatsapp"]),
@@ -70,6 +78,12 @@ class Notifier:
     def voice_clip(self, text: str) -> None:
         """WhatsApp message with the text and a spoken version attached (text only if the voice can't be rendered)."""
         name = tts.render(self.cfg, text)
+        if self._tg():
+            bot, chat = self._tg()
+            bot.send_message(chat, text)
+            if name:
+                bot.send_audio(chat, tts.AUDIO_DIR / name)
+            return
         self.message(text, [tts.audio_url(name)] if name and self.cfg["owner"].get("whatsapp") else None)
 
     def call(self, text: str, status_callback: bool = False) -> str:
