@@ -27,6 +27,7 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  recipient address, the account it is sent from, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
  {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
  {{"type":"discard_draft"}}
+ {{"type":"call_me"}} = phone {owner} right now (when asked to call/ring them). Reply with one short sentence like "Ringing you now."
  {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and message {owner} the options with map and Uber Eats links.
  Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll message you the options in a minute." Never list places yourself.
  {{"type":"add_favorite","item":str}} | {{"type":"remove_favorite","item":str}} = {owner}'s favourite groceries (Swedish item names, e.g. "havregryn")
@@ -147,6 +148,12 @@ class Brain:
                         failed = "I could not send that email. There may be no draft waiting."
             elif t == "discard_draft":
                 self.store.set("draft", None)
+            elif t == "call_me" and self.notifier is not None:
+                try:
+                    self.notifier.callback()
+                except Exception:
+                    log.exception("call_me failed")
+                    failed = "I tried to ring you, but the call was refused."
             elif t == "find_places" and a.get("request") and self.notifier is not None:
                 errands.run_async(errands.places_job, self.cfg, self.notifier, str(a["request"])[:200])
             elif t == "add_favorite" and a.get("item"):
