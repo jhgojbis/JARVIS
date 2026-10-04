@@ -231,8 +231,13 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
                 if data == "del:all" or re.fullmatch(r"del:\d{1,2}", data):
                     tg.send_message(owner, tg_trash(data.split(":")[1]))
             elif str(msg.get("text", "")).strip():
+                t0 = time.monotonic()
                 tg.typing(owner)
-                tg.send_message(owner, brain.chat("telegram", str(msg["text"])[:1000]))
+                reply = brain.chat("telegram", str(msg["text"])[:1000])
+                t1 = time.monotonic()
+                tg.send_message(owner, reply)
+                # latest timing, readable from the database: how long the brain took vs the whole turn
+                store.set("tg_timing", {"brain_s": round(t1 - t0, 2), "total_s": round(time.monotonic() - t0, 2), "text": str(msg["text"])[:30]})
         except Exception:
             log.exception("telegram update failed")
 
