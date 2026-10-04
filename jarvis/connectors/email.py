@@ -21,7 +21,7 @@ def accounts(cfg: Config) -> list[dict]:
         prefix = a.get("env_prefix", "")
         user, pw = Config.env(f"{prefix}EMAIL_ADDRESS"), Config.env(f"{prefix}EMAIL_APP_PASSWORD").replace(" ", "")
         if user and pw:
-            out.append({"name": a.get("name") or "private", "user": user, "pw": pw, "priority": a.get("priority", "normal"),
+            out.append({"name": a.get("name") or "private", "user": user, "pw": pw, "priority": a.get("priority", "normal"), "unread_only": bool(a.get("unread_only", False)),
                         "imap": a.get("imap_host") or cfg["email"]["imap_host"], "smtp": a.get("smtp_host") or cfg["email"]["smtp_host"]})
     return out
 
@@ -142,9 +142,13 @@ def _fetch(cfg: Config, criteria: str, limit: int, snippet: int, name: str | Non
         ids = data[0].split()[-limit:]
         out = []
         for i in ids:
-            _, msg = M.fetch(i, "(FLAGS BODY.PEEK[])")
-            m = parse_message(msg[0][1], snippet)
-            m["unread"] = b"\\Seen" not in msg[0][0]
+            # header + the first 30 KB of the body only: attachments and huge newsletters made this take seconds per mail
+            _, msg = M.fetch(i, "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.30000>)")
+            parts = [x for x in msg if isinstance(x, tuple)]
+            head = next((d for info, d in parts if b"HEADER" in info), b"")
+            body = next((d for info, d in parts if b"TEXT" in info), b"")
+            m = parse_message(head + b"\r\n" + body, snippet)
+            m["unread"] = b"\\Seen" not in b" ".join(info for info, _ in parts)
             out.append(m)
         return out
     finally:

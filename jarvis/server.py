@@ -179,7 +179,12 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     async def owner_digest(sid: str) -> Response:
         """First thing when the owner phones in: read the inbox, say what needs them, then listen."""
         def run() -> str:
-            text = skills.digest()
+            text, summary = skills.digest_with_summary()
+            if summary:                       # the numbered list goes to WhatsApp before Jarvis starts reading it out
+                try:
+                    notifier.message(summary)
+                except Exception:
+                    log.exception("could not send the numbered summary")
             store.add_history("voice", "assistant", text)
             return text
         pending[sid] = (asyncio.get_running_loop().run_in_executor(None, run), time.monotonic())

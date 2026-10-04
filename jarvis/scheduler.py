@@ -40,7 +40,8 @@ class Scheduler:
             if not items:
                 return None
             n = len(items)
-            return f"{self.cfg['owner']['name']}, {n} email{'s need' if n > 1 else ' needs'} you. " + self.skills.email_text(items)
+            self.skills.set_numbered(items)            # "delete 1" / "reply 2" on the phone or WhatsApp now mean these
+            return f"{self.cfg['owner']['name']}, {n} email{'s need' if n > 1 else ' needs'} you. " + self.skills.say_items(items)
         if a == "calendar_alert":
             return " | ".join(self.skills.calendar_alerts()) or None
         if a == "briefing":

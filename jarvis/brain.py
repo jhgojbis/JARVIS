@@ -18,11 +18,11 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  {{"type":"set_screening","enabled":bool}} | {{"type":"set_quiet_hours","start":"HH:MM","end":"HH:MM"}}
  {{"type":"send_whatsapp","text":str,"voice":bool}} = send {owner} a WhatsApp message (only ever to them). Use it when asked to send, forward or
  WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
- {{"type":"trash_email","n":int}} = move email [n] of the inbox listing below to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
- it; no confirmation needed. n is the [number] in the inbox listing below, NOT the order you read emails out in: find each email by sender/subject
- in the listing. Several emails = one trash_email action each. If two emails match, ask which one instead of guessing.
- {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str,"account":str}} = prepare an email, NEVER sends. Reply to inbox email [n]: give n and the
- body (to/subject/account are filled in: it leaves from the account that received it). Forward [n]: n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body, and "account" = one of the email accounts listed below (default: the first).
+ {{"type":"trash_email","n":int}} = move numbered email [n] to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
+ it; no confirmation needed. n is the [number] in the numbered list below, the same numbers as in the summary sent to WhatsApp and read out ("delete all" = every
+ number of the latest summary, [1]..[N]; "delete 2" = [2]). If the owner names an email instead of a number, find it by sender/subject. One trash_email action each. If two emails match, ask which one instead of guessing.
+ {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str,"account":str}} = prepare an email, NEVER sends. Reply to numbered email [n] ("reply 2 ..."): give n and the
+ body (to/subject/account are filled in: it leaves from the account that received it). Forward [n] ("forward 3 to ..."): n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body, and "account" = one of the email accounts listed below (default: the first).
  Write the body in the language of the person it goes to, as {owner} would, short, signed with {owner}'s name only. After drafting, your reply MUST read out the
  recipient address, the account it is sent from, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
  {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
@@ -31,6 +31,7 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll WhatsApp you the options in a minute." Never list places yourself.
  {{"type":"add_favorite","item":str}} | {{"type":"remove_favorite","item":str}} = {owner}'s favourite groceries (Swedish item names, e.g. "havregryn")
  {{"type":"send_groceries","items":[str]}} = WhatsApp {owner} Hemköp links for the items (default: all favourites). You cannot fill the cart, order or pay: say so if asked.
+Never ask which mailbox: every mailbox is already in the numbered list. When asked to check or read email, use the list; do not ask what to check.
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
@@ -59,8 +60,11 @@ class Brain:
         try:
             if self.cfg["email"]["enabled"]:
                 ctx.append("Email accounts: " + (self.skills.account_names() or "none with credentials"))
-            if (EMAIL_WORDS.search(text) or self.skills.inbox_recent()) and self.cfg["email"]["enabled"]:
-                ctx.append("Inbox, newest first:\n" + (self.skills.inbox_text() or "empty"))
+            if self.cfg["email"]["enabled"]:
+                if EMAIL_WORDS.search(text):           # asking about mail: refresh the recent mail behind the numbered list
+                    ctx.append("Numbered emails (all mailboxes):\n" + (self.skills.inbox_text() or "empty"))
+                elif self.skills.inbox_recent():       # "delete 1", "reply 2 ...": use the saved list, no slow mailbox fetch
+                    ctx.append("Numbered emails (all mailboxes):\n" + (self.skills.numbered_text() or "empty"))
             if CAL_WORDS.search(text) and self.cfg["calendar"]["enabled"]:
                 ctx.append("Calendar next 48h: " + (self.skills.calendar_text(48) or "nothing"))
         except Exception as e:

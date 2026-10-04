@@ -1,12 +1,13 @@
 """Outbound channels through Twilio: WhatsApp/SMS message, voice clip, or Jarvis phones you."""
 from __future__ import annotations
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from . import tts
 from .config import Config, norm_number
 
 log = logging.getLogger("jarvis.notify")
+SMS_CHARS = 150
 HEARD_SECONDS = 10      # a call that "completed" in less than this was almost certainly voicemail or a reject
 
 
@@ -41,9 +42,17 @@ class Notifier:
             self.sms(text, media)
 
     def sms(self, text: str, media: list[str] | None = None) -> None:
-        """Plain SMS; a voice clip can't ride along, so it becomes a link."""
-        body = text + (f" Listen: {media[0]}" if media else "")
-        self.client.messages.create(from_=Config.env("TWILIO_NUMBER"), to=norm_number(self.cfg["owner"]["phone"]), body=body[:1500])
+        """Fallback SMS. Every 160 characters is a billed segment (about 0.65 kr), so it is cut short, a voice clip becomes a
+        link, and at most calls.sms_per_day go out per day. The full text is on WhatsApp / ask Jarvis by phone."""
+        if self.store is not None:
+            day, c = date.today().isoformat(), self.store.get("sms_count") or {}
+            n = c.get("n", 0) if c.get("day") == day else 0
+            if n >= self.cfg["calls"]["sms_per_day"]:
+                log.warning("SMS limit reached for today, not sending")
+                return
+            self.store.set("sms_count", {"day": day, "n": n + 1})
+        body = (text if len(text) <= SMS_CHARS else text[:SMS_CHARS - 3].rstrip() + "...") + (f" Listen: {media[0]}" if media else "")
+        self.client.messages.create(from_=Config.env("TWILIO_NUMBER"), to=norm_number(self.cfg["owner"]["phone"]), body=body)
 
     def whatsapp_status(self, sid: str, status: str) -> bool:
         """WhatsApp reported on a message. Undelivered (typically the 24 h window is closed) -> resend as SMS. True if resent."""

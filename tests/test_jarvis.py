@@ -359,7 +359,7 @@ def test_digest_rechecks_everything_unread_even_if_already_alerted(tmp_path, mon
                                FakeLLM({"important": [{"i": 0, "why": "invoice due Friday"}]}, {"important": [{"i": 0, "why": "invoice due Friday"}]}))
     sk.important_email()                                                 # the scheduler already alerted about it
     d = sk.digest()
-    assert "1 email needs you" in d and "First, Anna Lind: invoice due Friday." in d and d.endswith("What can I do for you?")
+    assert "1 email needs you" in d and "Number 1, Anna Lind: invoice due Friday." in d and d.endswith("What can I do for you?")
 
 
 def test_digest_all_clear_and_mail_down(tmp_path, monkeypatch):
@@ -891,3 +891,125 @@ def test_one_failed_deletion_is_reported_but_the_others_still_happen(tmp_path, m
     b, _, trashed = trash_brain(tmp_path, monkeypatch, [{"type": "trash_email", "n": n} for n in (1, 2, 3)], fail_ids=("<2>",))
     assert "could not move all" in b.chat("voice", "delete all three")
     assert trashed == ["<3>", "<1>"]
+
+
+# ---------------- numbered summary: WhatsApp first, same numbers everywhere, unread-only work mail ----------------
+SUMMARY_MAILS = [{"id": f"<{i}>", "from": f"P{i} <p{i}@x.se>", "subject": f"Ämne {i}", "snippet": f"text {i}", "reply_to": f"p{i}@x.se", "unread": True}
+                 for i in (1, 2, 3)]
+
+
+def summary_skills(tmp_path, monkeypatch, *replies, mails=SUMMARY_MAILS, **over):
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(mails))
+    monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, **k: list(mails))
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True}, **over)
+    llm = FakeLLM({"important": [{"i": i, "why": f"reason {i + 1}"} for i in range(len(mails))]}, *replies)
+    return cfg, store, llm, Skills(cfg, store, llm)
+
+
+def test_digest_numbers_items_and_builds_the_whatsapp_summary(tmp_path, monkeypatch):
+    _, _, _, sk = summary_skills(tmp_path, monkeypatch)
+    spoken, summary = sk.digest_with_summary()
+    assert "3 emails need you. Number 1, P1: reason 1. Number 2, P2: reason 2. Number 3, P3: reason 3." in spoken
+    lines = summary.splitlines()
+    assert lines[0] == "3 emails need you:" and lines[1] == "1. P1: reason 1" and lines[3] == "3. P3: reason 3"
+    assert "delete all" in summary and "reply 2" in summary
+    assert sk.summary_count() == 3 and [m["id"] for m in sk.numbered()[:3]] == ["<1>", "<2>", "<3>"]
+
+
+def test_nothing_important_sends_no_whatsapp(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: [dict(SUMMARY_MAILS[0])])
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    sk = Skills(cfg, store, FakeLLM({"important": []}))
+    spoken, summary = sk.digest_with_summary()
+    assert "Nothing in your inbox needs you" in spoken and summary == ""
+
+
+def test_calling_in_sends_the_numbered_summary_to_whatsapp_before_reading(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_PHONE_PIN", raising=False)
+    sent = []
+
+    class N(FakeNotifier):
+        def message(self, t, media=None): sent.append(t)
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(SUMMARY_MAILS))
+    monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, **k: list(SUMMARY_MAILS))
+    cfg, _, _, _ = make(tmp_path, email={"enabled": True}, calls={"callback": False})
+    llm = FakeLLM({"important": [{"i": 0, "why": "invoice"}, {"i": 1, "why": "booking"}]})
+    c = TestClient(create_app(cfg, Store(str(tmp_path / "w.db")), llm, N(), verify_twilio=False))
+    with c:
+        r = c.post("/voice/incoming", data={"From": "+15551112222", "CallSid": "CA8"}).text
+    assert sent and sent[0].startswith("2 emails need you:") and "1. P1: invoice" in sent[0]
+    assert "Number 1, P1: invoice" in r and "Number 2, P2: booking" in r
+
+
+def test_delete_all_and_numbers_stay_put_after_a_deletion(tmp_path, monkeypatch):
+    trashed = []
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid, account=None: trashed.append(mid))
+    monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: None)
+    cfg, store, llm, sk = summary_skills(tmp_path, monkeypatch,
+        {"reply": "Gone.", "actions": [{"type": "trash_email", "n": 1}]},
+        {"reply": "Draft.", "actions": [{"type": "draft_email", "n": 2, "body": "Ja. /Sam"}]},
+        {"reply": "Again?", "actions": [{"type": "trash_email", "n": 1}]},
+        {"reply": "Gone.", "actions": [{"type": "trash_email", "n": 2}, {"type": "trash_email", "n": 3}]})
+    sk.digest_with_summary()
+    b = Brain(cfg, store, llm, sk, None)
+    b.chat("whatsapp", "delete 1")
+    assert trashed == ["<1>"] and "(deleted)" in sk.numbered_text() and sk.numbered_text().count("[2]") == 1
+    b.chat("whatsapp", "reply 2 with yes")
+    assert sk.pending_draft()["to"] == "p2@x.se" and sk.pending_draft()["in_reply_to"] == "<2>"       # still number 2
+    assert "could not move" in b.chat("whatsapp", "delete 1 again")                                  # already gone
+    b.chat("whatsapp", "delete all the rest")
+    assert trashed == ["<1>", "<2>", "<3>"]
+
+
+def test_saved_list_is_used_for_commands_without_a_mailbox_fetch(tmp_path, monkeypatch):
+    cfg, store, llm, sk = summary_skills(tmp_path, monkeypatch, {"reply": "ok", "actions": []})
+    sk.digest_with_summary()
+    import time as _t
+    _t.sleep(0.2)
+    monkeypatch.setattr(mailmod, "fetch_recent", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")))
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")))
+    sk._inbox = None
+    Brain(cfg, store, llm, sk, None).chat("whatsapp", "delete 2")
+    assert "Numbered emails" in llm.calls[-1][0] and "Latest summary = [1]..[3]" in llm.calls[-1][0]
+
+
+def test_unread_only_mailbox_lists_only_unread_mail(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAKLAR_EMAIL_ADDRESS", "info@maklarkontroll.se")
+    monkeypatch.setenv("MAKLAR_EMAIL_APP_PASSWORD", "pw")
+    unread = [{"id": "<u>", "from": "Kund <k@x.se>", "subject": "Ny förfrågan", "snippet": "hej", "reply_to": "k@x.se", "unread": True}]
+    recent = unread + [{"id": "<r>", "from": "Gammal <g@x.se>", "subject": "Läst redan", "snippet": "x", "reply_to": "g@x.se", "unread": False}]
+    calls = []
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, account=None, **k: calls.append(("unread", account)) or list(unread))
+    monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, account=None, **k: calls.append(("recent", account)) or list(recent))
+    accts = {"accounts": [{"name": "private"}, {"name": "Maklarkontroll", "env_prefix": "MAKLAR_", "priority": "high", "unread_only": True}]}
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True, **accts})
+    text = Skills(cfg, store, FakeLLM()).inbox_text()
+    assert ("unread", "Maklarkontroll") in calls and ("recent", "Maklarkontroll") not in calls and ("recent", "private") in calls
+    assert "Läst redan" in text and text.count("Ny förfrågan") == 2          # work: unread only (once); private: recent
+    assert mailmod.accounts(cfg)[1]["unread_only"] is True
+
+
+def test_alert_numbers_the_mail_it_reports(tmp_path, monkeypatch):
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(SUMMARY_MAILS))
+    sk = Skills(cfg, store, FakeLLM({"important": [{"i": 0, "why": "invoice"}, {"i": 2, "why": "booking"}]}))
+    text = Scheduler(cfg, store, sk, FakeNotifier()).run_job({"action": "email_check"})
+    assert "Number 1, P1: invoice. Number 2, P3: booking." in text
+    assert sk.summary_count() == 2 and sk.numbered()[1]["id"] == "<3>"
+
+
+# ---------------- the SMS fallback is short and capped ----------------
+def test_sms_fallback_is_cut_to_one_or_two_segments(alerts):
+    _, _, tw, n = alerts
+    n.sms("x" * 600)
+    assert len(tw.sent[0]["body"]) <= 150 and tw.sent[0]["body"].endswith("...")
+    n.sms("Invoice due", ["https://j.example/audio/" + "a" * 32 + ".mp3"])
+    assert tw.sent[1]["body"].startswith("Invoice due Listen: https://") and len(tw.sent[1]["body"]) < 160 + 60
+
+
+def test_sms_fallback_has_a_daily_limit(alerts):
+    cfg, _, tw, n = alerts
+    cfg["calls"]["sms_per_day"] = 2
+    for _ in range(5):
+        n.sms("hello")
+    assert len(tw.sent) == 2
