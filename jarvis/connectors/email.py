@@ -140,11 +140,19 @@ def _fetch(cfg: Config, criteria: str, limit: int, snippet: int, name: str | Non
         M.select("INBOX", readonly=True)       # readonly: never marks mail as read
         _, data = M.search(None, criteria)
         ids = data[0].split()[-limit:]
+        if not ids:
+            return []
+        # one round trip for all messages (a fetch per message cost ~0.3 s each); header + the first 30 KB of the body only:
+        # attachments and huge newsletters made this take seconds per mail
+        _, msg = M.fetch(b",".join(ids).decode(), "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.30000>)")
+        groups: list[list] = []                # a new message starts at "<seq> (FLAGS ..."; its TEXT part carries no number
+        for x in msg:
+            if isinstance(x, tuple):
+                if re.match(rb"\d+ \(", x[0]) or not groups:
+                    groups.append([])
+                groups[-1].append(x)
         out = []
-        for i in ids:
-            # header + the first 30 KB of the body only: attachments and huge newsletters made this take seconds per mail
-            _, msg = M.fetch(i, "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.30000>)")
-            parts = [x for x in msg if isinstance(x, tuple)]
+        for parts in groups:
             head = next((d for info, d in parts if b"HEADER" in info), b"")
             body = next((d for info, d in parts if b"TEXT" in info), b"")
             m = parse_message(head + b"\r\n" + body, snippet)

@@ -183,13 +183,28 @@ class Skills:
         mailboxes marked unread_only). The recent-mail fetch is cached for a minute so follow-up questions stay fast."""
         if not self.cfg["email"]["enabled"]:
             return ""
-        cached = getattr(self, "_inbox", None)
-        if not cached or time.time() - cached[0] > 60:
+        def refresh():
             fetched = self._fetch_all(mail.fetch_recent, mail.fetch_unread, limit=n, snippet=snippet)
             listing = []
             for name in dict.fromkeys(m["account"] for m in fetched):          # work mail first, newest first inside each mailbox
                 listing += list(reversed([m for m in fetched if m["account"] == name]))
             self._inbox = (time.time(), list(reversed(listing)))
+
+        cached = getattr(self, "_inbox", None)
+        age = time.time() - cached[0] if cached else None
+        if age is None or age > 600:                       # nothing usable: wait for the mailbox
+            refresh()
+        elif age > 60 and not getattr(self, "_refreshing", False):   # slightly stale: answer now, refresh behind the scenes
+            self._refreshing = True
+
+            def bg():
+                try:
+                    refresh()
+                except Exception:
+                    log.exception("background inbox refresh failed")
+                finally:
+                    self._refreshing = False
+            threading.Thread(target=bg, daemon=True).start()
         return self.numbered_text()
 
     def _gone(self, picked: list[dict]) -> None:
