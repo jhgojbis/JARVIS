@@ -9,7 +9,8 @@ owner:
 voice:
   # Free default: Amazon Polly voices are built into Twilio <Say>. British male = Jarvis-like.
   twilio_voice: "Polly.Brian-Neural"
-  language: "en-GB"
+  language: "en-GB"          # language of Jarvis' own voice
+  listen_language: "sv-SE"   # what you speak on calls (Twilio takes one language per prompt); empty = same as language
   assistant_name: "Jarvis"
 
 llm:

@@ -1132,3 +1132,12 @@ def test_telegram_client_raises_on_api_errors(monkeypatch):
     monkeypatch.setattr(tgmod.requests, "post", lambda *a, **k: R())
     with pytest.raises(RuntimeError, match="chat not found"):
         tgmod.Telegram("t").send_message(1, "x")
+
+
+def test_owner_calls_listen_in_their_own_language():
+    from jarvis.notify import say_and_listen
+    cfg = Config(_merge(DEFAULTS, {}))
+    assert 'language="en-GB"' in say_and_listen(cfg, "Hello", "/x")
+    cfg = Config(_merge(DEFAULTS, {"voice": {"listen_language": "sv-SE"}}))
+    xml = say_and_listen(cfg, "Hello", "/x")
+    assert 'Gather input="speech"' in xml and 'language="sv-SE"' in xml

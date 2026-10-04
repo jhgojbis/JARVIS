@@ -137,5 +137,6 @@ class Notifier:
 
 def say_and_listen(cfg: Config, text: str, action: str) -> str:
     from xml.sax.saxutils import escape
-    return (f'<Response><Gather input="speech" action="{escape(action)}" speechTimeout="auto" language="{cfg["voice"]["language"]}">'
+    listen = cfg["voice"].get("listen_language") or cfg["voice"]["language"]      # what the owner speaks; replies stay English
+    return (f'<Response><Gather input="speech" action="{escape(action)}" speechTimeout="auto" language="{listen}">'
             f'{tts.tag(cfg, text)}</Gather>{tts.tag(cfg, "Goodbye.")}</Response>')
