@@ -9,7 +9,8 @@ DEFAULTS = {
     "voice": {"twilio_voice": "Polly.Brian-Neural", "language": "en-GB", "assistant_name": "Jarvis",
               "engine": "polly"},   # polly (Twilio <Say>) | thomas | luke (edge-tts, played with <Play>)
     # Jarvis only phones inside this window; outside it (or when you don't pick up) you get a WhatsApp voice clip instead.
-    "calls": {"start": "09:00", "end": "24:00", "weekdays_only": False},
+    "calls": {"start": "09:00", "end": "24:00", "weekdays_only": False,
+              "callback": True},   # you ring Jarvis, it rejects the call (free) and rings you back (calls to a US number cost you)
     "llm": {"backend": "anthropic", "model": "claude-haiku-4-5-20251001", "max_tokens": 400, "daily_token_budget": 200000},
     "screening": {"enabled": True, "vip": [], "block_unknown_spam": True, "allow_urgent": True,
                   "greeting": "Hello, this is {assistant}, {owner}'s assistant. Who is calling, and what is it about?"},

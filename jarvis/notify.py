@@ -71,6 +71,12 @@ class Notifier:
                                      twiml=say_and_listen(self.cfg, text, f"{base}/voice/owner"), **extra)
         return c.sid
 
+    def callback(self) -> str:
+        """Ring the owner back; the call opens with the same mail digest as when the owner phones in."""
+        base = Config.env("PUBLIC_URL").rstrip("/")
+        return self.client.calls.create(from_=Config.env("TWILIO_NUMBER"), to=norm_number(self.cfg["owner"]["phone"]),
+                                        url=f"{base}/voice/owner_start", method="POST").sid
+
     def alert(self, text: str, now: datetime | None = None) -> str:
         """Something you must react to: phone you inside the call window; if you don't pick up (see
         /voice/call_status) or it is outside the window, send a WhatsApp voice clip instead."""

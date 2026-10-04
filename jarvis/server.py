@@ -21,6 +21,7 @@ log = logging.getLogger("jarvis")
 # Twilio abandons a webhook after 15 s, but the claude_cli backend can take longer. Voice replies not ready
 # within FAST_WAIT are finished in the background while Twilio polls /voice/owner_wait (each poll < HOLD_WAIT).
 FAST_WAIT, HOLD_WAIT, MAX_WAIT, SCREEN_TIMEOUT = 3.0, 9.0, 90.0, 12.0
+CALLBACK_DELAY, CALLBACK_COOLDOWN = 4.0, 30.0       # seconds: wait before ringing back / minimum gap between two call-backs
 PHRASES = ("Goodbye.", "One moment, sir.", "Good day. One moment while I check your mail.", "I did not hear anything. Goodbye.",
            "One moment, let me see if they are available.", "Thank you. Goodbye.", "Very good. Goodbye.",
            "Sorry, I lost my train of thought. What was that?", "Sorry. Goodbye.")
@@ -82,6 +83,14 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
         if norm_number(caller) and norm_number(caller) == norm_number(Config.env("TWILIO_NUMBER")):
             return xml("<Response><Hangup/></Response>")      # our own number: an unanswered alert call forwarded back to us
         if norm_number(caller) and norm_number(caller) == norm_number(cfg["owner"]["phone"]):
+            if cfg["calls"]["callback"]:
+                # Reject (not billed, so it costs the owner nothing) and ring back. Spoofing the owner's number is harmless
+                # here: the call-back always goes to the real owner number, and repeats are rate-limited.
+                if time.time() - store.get("callback_ts", 0) > CALLBACK_COOLDOWN:
+                    store.set("callback_ts", time.time())
+                    loop = asyncio.get_running_loop()
+                    loop.call_later(CALLBACK_DELAY, lambda: loop.run_in_executor(None, notifier.callback))
+                return xml('<Response><Reject reason="busy"/></Response>')
             # Caller ID can be spoofed, so a keypad PIN (JARVIS_PHONE_PIN in .env) guards owner mode when set.
             if Config.env("JARVIS_PHONE_PIN"):
                 return xml(f'<Response><Gather input="dtmf" finishOnKey="#" timeout="8" action="{url("/voice/owner_pin")}">'
@@ -175,6 +184,12 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
             return text
         pending[sid] = (asyncio.get_running_loop().run_in_executor(None, run), time.monotonic())
         return await owner_reply(sid, FAST_WAIT, hold="Good day. One moment while I check your mail.")
+
+    @app.post("/voice/owner_start")
+    async def owner_start(request: Request):
+        """The call-back Jarvis placed to the owner was answered: same opening as when the owner phones in."""
+        f = await check_twilio(request)
+        return await owner_digest(f.get("CallSid", ""))
 
     @app.post("/voice/call_status")
     async def call_status(request: Request):

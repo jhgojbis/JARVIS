@@ -142,7 +142,7 @@ def test_slow_owner_reply_holds_then_delivers(tmp_path, monkeypatch):
 
 
 def test_owner_calling_in_gets_owner_mode_and_pin(tmp_path, monkeypatch):
-    _, _, _, c = make(tmp_path)
+    _, _, _, c = make(tmp_path, calls={"callback": False})
     monkeypatch.delenv("JARVIS_PHONE_PIN", raising=False)
     r = c.post("/voice/incoming", data={"From": "+1 555 111 2222"}).text
     assert "/voice/owner" in r and "/voice/screen" not in r
@@ -371,7 +371,7 @@ def test_digest_all_clear_and_mail_down(tmp_path, monkeypatch):
 
 def test_owner_phoning_in_hears_the_digest_first(tmp_path, monkeypatch):
     monkeypatch.delenv("JARVIS_PHONE_PIN", raising=False)
-    cfg, store, _, c = make(tmp_path, email={"enabled": True},
+    cfg, store, _, c = make(tmp_path, email={"enabled": True}, calls={"callback": False},
                             llm=FakeLLM({"important": [{"i": 0, "why": "invoice due Friday"}]}))
     monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: list(MAILS))
     monkeypatch.setattr(mailmod, "fetch_recent", lambda cfg, *a, **k: list(MAILS))
@@ -793,3 +793,63 @@ def test_send_uses_the_drafts_account_over_smtp(tmp_path, monkeypatch):
     cfg, *_ = make(tmp_path, email=TWO)
     mailmod.send(cfg, {"to": "kund@x.se", "subject": "Re: Visning", "body": "Ja", "in_reply_to": "<w1>", "account": "Maklarkontroll"})
     assert ("login", "info@maklarkontroll.se", "abcdefghijklmnop") in sent and ("from", "info@maklarkontroll.se") in sent
+
+
+# ---------------- ring Jarvis, it rejects (free) and calls back ----------------
+class CallbackNotifier(FakeNotifier):
+    calls = 0
+
+    def callback(self): CallbackNotifier.calls += 1
+
+
+def callback_client(tmp_path, monkeypatch, **over):
+    from jarvis import server
+    monkeypatch.setattr(server, "CALLBACK_DELAY", 0.01)
+    CallbackNotifier.calls = 0
+    cfg, _, _, _ = make(tmp_path, **over)
+    return TestClient(create_app(cfg, Store(str(tmp_path / "cb.db")), FakeLLM(), CallbackNotifier(), verify_twilio=False))
+
+
+def test_owner_call_is_rejected_then_called_back(tmp_path, monkeypatch):
+    import time as _t
+    c = callback_client(tmp_path, monkeypatch)
+    with c:
+        r = c.post("/voice/incoming", data={"From": "+1 555 111 2222"}).text
+        _t.sleep(0.3)
+    assert "<Reject" in r and "Gather" not in r and "Dial" not in r
+    assert CallbackNotifier.calls == 1
+
+
+def test_callbacks_are_rate_limited(tmp_path, monkeypatch):
+    import time as _t
+    c = callback_client(tmp_path, monkeypatch)
+    with c:
+        for _ in range(3):
+            assert "<Reject" in c.post("/voice/incoming", data={"From": "+15551112222"}).text
+        _t.sleep(0.3)
+    assert CallbackNotifier.calls == 1
+
+
+def test_strangers_are_not_called_back_and_callback_can_be_switched_off(tmp_path, monkeypatch):
+    import time as _t
+    c = callback_client(tmp_path, monkeypatch)
+    with c:
+        assert "<Gather" in c.post("/voice/incoming", data={"From": "+19998887777"}).text
+        _t.sleep(0.2)
+    assert CallbackNotifier.calls == 0
+    off = callback_client(tmp_path, monkeypatch, calls={"callback": False})
+    assert "<Reject" not in off.post("/voice/incoming", data={"From": "+15551112222"}).text
+
+
+def test_answered_callback_opens_with_the_digest(tmp_path, monkeypatch):
+    c = callback_client(tmp_path, monkeypatch)
+    with c:
+        r = c.post("/voice/owner_start", data={"CallSid": "CA77"}).text
+    assert "Good day, Sam" in r and "/voice/owner" in r
+
+
+def test_notifier_callback_fetches_twiml_from_owner_start(alerts):
+    _, _, tw, n = alerts
+    n.callback()
+    k = tw.made[0]
+    assert k["to"] == "+15551112222" and k["url"] == "https://j.example/voice/owner_start" and k["method"] == "POST" and "twiml" not in k
