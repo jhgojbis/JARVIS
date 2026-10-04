@@ -133,16 +133,31 @@ class Skills:
         return "\n".join(f"[{i + 1}]{label(m)} From {m['from']} | Subject: {m['subject']} | {m['snippet']}"
                          for i, m in enumerate(reversed(cached[1])))
 
-    def trash_inbox_item(self, n: int) -> str:
-        """Move email [n] of the inbox listing last read out to the trash; returns its subject."""
+    def trash_inbox_items(self, ns: list[int]) -> list[str]:
+        """Move emails [n...] of the inbox listing last read out to the trash; returns their subjects. All numbers are
+        resolved against the same listing first (deleting shifts the numbering), and one failure does not stop the rest."""
         cached = getattr(self, "_inbox", None)
         items = list(reversed(cached[1])) if cached else []
-        if not 1 <= n <= len(items):
-            raise LookupError("no such email in the listing")
-        m = items[n - 1]
-        mail.trash(self.cfg, m["id"], account=m.get("account"))
+        picked = []
+        for n in dict.fromkeys(ns):
+            if not 1 <= n <= len(items):
+                raise LookupError("no such email in the listing")
+            picked.append(items[n - 1])
+        done, failed = [], 0
+        for m in picked:
+            try:
+                mail.trash(self.cfg, m["id"], account=m.get("account"))
+                done.append(m["subject"])
+            except Exception:
+                failed += 1
+                log.exception("could not trash %r", m["subject"])
         self._inbox = None                      # the listing has changed
-        return m["subject"]
+        if failed:
+            raise RuntimeError(f"{failed} of {len(picked)} emails could not be moved")
+        return done
+
+    def trash_inbox_item(self, n: int) -> str:
+        return self.trash_inbox_items([n])[0]
 
     DRAFT_TTL = 1800        # an unsent draft is forgotten after 30 minutes
 

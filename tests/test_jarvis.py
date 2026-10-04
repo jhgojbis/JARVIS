@@ -853,3 +853,41 @@ def test_notifier_callback_fetches_twiml_from_owner_start(alerts):
     n.callback()
     k = tw.made[0]
     assert k["to"] == "+15551112222" and k["url"] == "https://j.example/voice/owner_start" and k["method"] == "POST" and "twiml" not in k
+
+
+# ---------------- "delete all three emails": several deletions in one turn ----------------
+def trash_brain(tmp_path, monkeypatch, actions, fail_ids=()):
+    import time as _t
+    trashed = []
+
+    def fake_trash(cfg, mid, account=None):
+        if mid in fail_ids:
+            raise OSError("imap hiccup")
+        trashed.append(mid)
+    monkeypatch.setattr(mailmod, "trash", fake_trash)
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    llm = FakeLLM({"reply": "Done, Boss.", "actions": actions})
+    sk = Skills(cfg, store, llm)
+    three = [{"id": f"<{i}>", "from": "x <x@y.se>", "subject": f"s{i}", "snippet": "", "reply_to": "x@y.se"} for i in (1, 2, 3)]
+    sk._inbox = (_t.time(), three)                      # listing shows <3>, <2>, <1>
+    return Brain(cfg, store, llm, sk, None), sk, trashed
+
+
+def test_three_deletions_in_one_turn_all_go_through(tmp_path, monkeypatch):
+    b, sk, trashed = trash_brain(tmp_path, monkeypatch, [{"type": "trash_email", "n": n} for n in (1, 2, 3)])
+    assert b.chat("voice", "delete all three emails") == "Done, Boss."
+    assert trashed == ["<3>", "<2>", "<1>"] and sk._inbox is None          # numbers meant the same listing throughout
+
+
+def test_duplicate_numbers_and_a_bad_number_do_not_delete_anything_half_way(tmp_path, monkeypatch):
+    b, _, trashed = trash_brain(tmp_path, monkeypatch, [{"type": "trash_email", "n": 1}, {"type": "trash_email", "n": 1}])
+    b.chat("voice", "delete it twice")
+    assert trashed == ["<3>"]
+    b2, _, trashed2 = trash_brain(tmp_path, monkeypatch, [{"type": "trash_email", "n": 1}, {"type": "trash_email", "n": 9}])
+    assert "could not move" in b2.chat("voice", "delete one and nine") and trashed2 == []
+
+
+def test_one_failed_deletion_is_reported_but_the_others_still_happen(tmp_path, monkeypatch):
+    b, _, trashed = trash_brain(tmp_path, monkeypatch, [{"type": "trash_email", "n": n} for n in (1, 2, 3)], fail_ids=("<2>",))
+    assert "could not move all" in b.chat("voice", "delete all three")
+    assert trashed == ["<3>", "<1>"]

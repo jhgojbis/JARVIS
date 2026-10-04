@@ -19,7 +19,8 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  {{"type":"send_whatsapp","text":str,"voice":bool}} = send {owner} a WhatsApp message (only ever to them). Use it when asked to send, forward or
  WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
  {{"type":"trash_email","n":int}} = move email [n] of the inbox listing below to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
- it; no confirmation needed. Pick n by sender/subject; if two emails match, ask which one instead of guessing.
+ it; no confirmation needed. n is the [number] in the inbox listing below, NOT the order you read emails out in: find each email by sender/subject
+ in the listing. Several emails = one trash_email action each. If two emails match, ask which one instead of guessing.
  {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str,"account":str}} = prepare an email, NEVER sends. Reply to inbox email [n]: give n and the
  body (to/subject/account are filled in: it leaves from the account that received it). Forward [n]: n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body, and "account" = one of the email accounts listed below (default: the first).
  Write the body in the language of the person it goes to, as {owner} would, short, signed with {owner}'s name only. After drafting, your reply MUST read out the
@@ -84,6 +85,7 @@ class Brain:
     def apply(self, actions: list) -> str:
         """Runs the whitelisted actions. Returns what to say instead of the LLM's reply if one failed, else ''."""
         c, changed, failed, drafted = self.cfg.data, False, "", False
+        trash_ns = [a["n"] for a in actions if isinstance(a, dict) and a.get("type") == "trash_email" and isinstance(a.get("n"), int)]
         for a in actions if isinstance(actions, list) else []:
             if not isinstance(a, dict):
                 continue
@@ -162,11 +164,13 @@ class Brain:
                         log.exception("send_groceries failed")
                         failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
             elif t == "trash_email" and isinstance(a.get("n"), int):
-                try:
-                    log.info("trashed email: %s", self.skills.trash_inbox_item(a["n"]))
-                except Exception:
-                    log.exception("trash_email failed")
-                    failed = "I could not move that email to the trash."
+                pass                                    # handled together below, so several deletions share one listing
+        if trash_ns:
+            try:
+                log.info("trashed emails: %s", self.skills.trash_inbox_items(trash_ns))
+            except Exception:
+                log.exception("trash_email failed")
+                failed = failed or "I could not move all of those emails to the trash."
         if changed:
             self.cfg.save()
         return failed
