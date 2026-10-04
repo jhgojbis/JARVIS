@@ -1,6 +1,8 @@
 """Email via IMAP (works with Gmail/Outlook/iCloud/Yahoo using an app password - no OAuth needed)."""
 from __future__ import annotations
-import email, html, imaplib, re
+import email, html, imaplib, re, smtplib, time
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from email.header import decode_header, make_header
 from email.utils import parseaddr
 from ..config import Config
@@ -40,13 +42,7 @@ def trash(cfg: Config, message_id: str) -> None:
         nums = data[0].split()
         if not nums:
             raise LookupError("message not found in the inbox")
-        folder = None
-        for line in M.list()[1]:
-            text = line.decode() if isinstance(line, bytes) else str(line)
-            if "\\Trash" in text:
-                folder = text.rsplit(' "/" ', 1)[-1].strip().strip('"') if ' "/" ' in text else text.rsplit(" ", 1)[-1].strip('"')
-        if not folder:
-            raise RuntimeError("no trash folder found")
+        folder = _folder(M, "\\Trash")
         for n in nums:
             M.copy(n, '"%s"' % folder)
             M.store(n, "+FLAGS", "\\Deleted")
@@ -56,6 +52,65 @@ def trash(cfg: Config, message_id: str) -> None:
             M.logout()
         except Exception:
             pass
+
+
+def _folder(M, attr: str) -> str:
+    """The server's own name for a special folder (\\Trash, \\Drafts...), whatever the account language."""
+    for line in M.list()[1]:
+        text = line.decode() if isinstance(line, bytes) else str(line)
+        if attr in text and ' "/" ' in text:
+            return text.rsplit(' "/" ', 1)[-1].strip().strip('"')
+    raise RuntimeError(f"no {attr} folder found")
+
+
+def fetch_body(cfg: Config, message_id: str, snippet: int = 4000) -> dict:
+    """One message in full (up to `snippet` characters of text), found by Message-ID. Never marks it read."""
+    M = _connect(cfg)
+    try:
+        M.select("INBOX", readonly=True)
+        _, data = M.search(None, "HEADER", "Message-ID", '"%s"' % message_id.replace('"', ""))
+        nums = data[0].split()
+        if not nums:
+            raise LookupError("message not found in the inbox")
+        _, msg = M.fetch(nums[-1], "(BODY.PEEK[])")
+        return parse_message(msg[0][1], snippet)
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+def build(cfg: Config, d: dict) -> EmailMessage:
+    m = EmailMessage()
+    m["From"], m["To"], m["Subject"] = Config.env("EMAIL_ADDRESS"), d["to"], d["subject"]
+    m["Date"], m["Message-ID"] = formatdate(localtime=True), make_msgid()
+    if d.get("in_reply_to"):
+        m["In-Reply-To"] = m["References"] = d["in_reply_to"]
+    m.set_content(d["body"])
+    return m
+
+
+def save_draft(cfg: Config, d: dict) -> None:
+    """Put the draft into the Gmail drafts folder so it shows up on the owner's phone too."""
+    M = _connect(cfg)
+    try:
+        M.append('"%s"' % _folder(M, "\\Drafts"), "\\Draft", imaplib.Time2Internaldate(time.time()), build(cfg, d).as_bytes())
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+def send(cfg: Config, d: dict) -> None:
+    """Send for real over SMTP (Gmail files it under Sent by itself)."""
+    user, pw = Config.env("EMAIL_ADDRESS"), Config.env("EMAIL_APP_PASSWORD").replace(" ", "")
+    if not (user and pw):
+        raise RuntimeError("EMAIL_ADDRESS / EMAIL_APP_PASSWORD not set")
+    with smtplib.SMTP_SSL(cfg["email"]["smtp_host"], 465, timeout=30) as S:
+        S.login(user, pw)
+        S.send_message(build(cfg, d))
 
 
 def _fetch(cfg: Config, criteria: str, limit: int, snippet: int) -> list[dict]:
@@ -89,5 +144,6 @@ def parse_message(raw: bytes, snippet: int = 200) -> dict:
     body = parts.get("text/plain") or ""
     if not body.strip() and "text/html" in parts:   # many senders ship HTML only
         body = html.unescape(re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", parts["text/html"], flags=re.S | re.I))
-    return {"id": m.get("Message-ID", ""), "from": f"{name} <{addr}>" if name else addr,
+    rname, raddr = parseaddr(_dec(m.get("Reply-To")))
+    return {"id": m.get("Message-ID", ""), "reply_to": raddr or addr, "from": f"{name} <{addr}>" if name else addr,
             "subject": _dec(m.get("Subject")), "snippet": " ".join(body.split())[:snippet]}

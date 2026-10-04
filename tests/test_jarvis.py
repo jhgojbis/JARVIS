@@ -499,3 +499,104 @@ def test_voice_trash_failure_is_not_reported_as_done(tmp_path, monkeypatch):
     sk = Skills(cfg, store, llm)
     sk._inbox = (_t.time(), MAILS)
     assert "could not move" in Brain(cfg, store, llm, sk, None).chat("voice", "delete it")
+
+
+# ---------------- drafting, replying, forwarding: nothing leaves without an explicit "send" ----------------
+@pytest.fixture
+def mailbox(tmp_path, monkeypatch):
+    import time as _t
+    out = {"sent": [], "saved": []}
+    monkeypatch.setattr(mailmod, "send", lambda cfg, d: out["sent"].append(dict(d)))
+    monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: out["saved"].append(dict(d)))
+    monkeypatch.setattr(mailmod, "fetch_body", lambda cfg, mid: {"from": "Anna Lind <anna@x.se>", "subject": "Faktura 4411",
+                                                                  "snippet": "Hej, fakturan förfaller fredag."})
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    mails = [dict(MAILS[0], reply_to="anna@x.se"), dict(MAILS[1], reply_to="news@shop.com")]
+
+    def brain(*replies):
+        llm = FakeLLM(*replies)
+        sk = Skills(cfg, store, llm)
+        sk._inbox = (_t.time(), mails)
+        return Brain(cfg, store, llm, sk, None), sk
+    return out, store, brain
+
+
+def test_reply_is_a_draft_and_is_not_sent(mailbox):
+    out, store, brain = mailbox
+    b, sk = brain({"reply": "Draft to anna@x.se, Re: Faktura 4411: I will pay on Friday. Shall I send it?",
+                   "actions": [{"type": "draft_email", "n": 2, "body": "Hej Anna, jag betalar på fredag. /Sam"}]})
+    assert "Shall I send" in b.chat("voice", "reply to Anna that I pay on Friday")
+    d = sk.pending_draft()
+    assert d["to"] == "anna@x.se" and d["subject"] == "Re: Faktura 4411" and d["in_reply_to"] == "<1>"
+    assert out["sent"] == [] and out["saved"][0]["to"] == "anna@x.se"
+
+
+def test_send_in_the_same_turn_as_the_draft_is_refused(mailbox):
+    out, _, brain = mailbox
+    b, sk = brain({"reply": "Sent!", "actions": [{"type": "draft_email", "n": 2, "body": "ok"}, {"type": "send_email"}]})
+    r = b.chat("voice", "reply ok and send it")
+    assert "only a draft" in r and out["sent"] == [] and sk.pending_draft()
+
+
+def test_send_after_hearing_the_draft_goes_out_once(mailbox):
+    out, store, brain = mailbox
+    b, sk = brain({"reply": "Draft read out.", "actions": [{"type": "draft_email", "n": 2, "body": "Hej Anna, ok. /Sam"}]},
+                  {"reply": "Sent, Boss.", "actions": [{"type": "send_email"}]},
+                  {"reply": "Sent again!", "actions": [{"type": "send_email"}]})
+    b.chat("voice", "reply ok")
+    assert b.chat("voice", "send it") == "Sent, Boss."
+    assert [m["to"] for m in out["sent"]] == ["anna@x.se"] and sk.pending_draft() is None
+    assert "could not send" in b.chat("voice", "send it again") and len(out["sent"]) == 1
+
+
+def test_forward_includes_the_original_and_needs_an_address(mailbox):
+    out, _, brain = mailbox
+    b, sk = brain({"reply": "Draft.", "actions": [{"type": "draft_email", "n": 2, "forward": True, "to": "bob@firma.se", "body": "FYI"}]},
+                  {"reply": "Draft.", "actions": [{"type": "draft_email", "n": 2, "forward": True, "to": "Bob", "body": "FYI"}]})
+    b.chat("voice", "forward Anna's invoice to Bob")
+    d = sk.pending_draft()
+    assert d["to"] == "bob@firma.se" and d["subject"] == "Fwd: Faktura 4411"
+    assert "Forwarded message" in d["body"] and "fakturan förfaller fredag" in d["body"] and d["body"].startswith("FYI")
+    assert "proper email address" in b.chat("voice", "forward it to Bob")
+
+
+def test_new_mail_needs_address_subject_and_text(mailbox):
+    _, _, brain = mailbox
+    b, sk = brain({"reply": "ok", "actions": [{"type": "draft_email", "to": "x@y.se", "subject": "", "body": "hi"}]},
+                  {"reply": "ok", "actions": [{"type": "draft_email", "to": "x@y.se", "subject": "Lunch", "body": "Tomorrow?"}]})
+    assert "proper email address" in b.chat("voice", "mail x")
+    b.chat("voice", "mail x@y.se about lunch")
+    assert sk.pending_draft()["subject"] == "Lunch"
+
+
+def test_draft_expires_and_can_be_discarded(mailbox, monkeypatch):
+    import time as _t
+    out, store, brain = mailbox
+    b, sk = brain({"reply": "d", "actions": [{"type": "draft_email", "n": 2, "body": "ok"}]},
+                  {"reply": "Discarded.", "actions": [{"type": "discard_draft"}]})
+    b.chat("voice", "reply ok")
+    store.set("draft", dict(store.get("draft"), ts=_t.time() - 3600))
+    assert sk.pending_draft() is None                                      # expired
+    sk.make_draft({"n": 2, "body": "ok"})
+    assert sk.pending_draft()
+    b.chat("voice", "forget it")
+    assert sk.pending_draft() is None
+
+
+def test_build_and_send_over_smtp(tmp_path, monkeypatch):
+    sent = []
+
+    class SMTP:
+        def __init__(self, host, port, timeout=0): sent.append(("connect", host, port))
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def login(self, u, p): sent.append(("login", u))
+        def send_message(self, m): sent.append(("msg", m))
+    monkeypatch.setenv("EMAIL_ADDRESS", "me@gmail.com")
+    monkeypatch.setenv("EMAIL_APP_PASSWORD", "pw")
+    monkeypatch.setattr(mailmod.smtplib, "SMTP_SSL", SMTP)
+    cfg, *_ = make(tmp_path)
+    mailmod.send(cfg, {"to": "anna@x.se", "subject": "Re: Faktura", "body": "Hej!", "in_reply_to": "<1>"})
+    assert sent[0] == ("connect", "smtp.gmail.com", 465) and sent[1] == ("login", "me@gmail.com")
+    m = sent[2][1]
+    assert m["To"] == "anna@x.se" and m["From"] == "me@gmail.com" and m["In-Reply-To"] == "<1>" and m.get_content().strip() == "Hej!"

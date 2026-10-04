@@ -19,6 +19,12 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
  {{"type":"trash_email","n":int}} = move email [n] of the inbox listing below to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
  it; no confirmation needed. Pick n by sender/subject; if two emails match, ask which one instead of guessing.
+ {{"type":"draft_email","n":int,"forward":bool,"to":str,"subject":str,"body":str}} = prepare an email, NEVER sends. Reply to inbox email [n]: give n and the
+ body (to/subject are filled in). Forward [n]: n, forward:true, to, and a short body. New mail: to (a real address seen in the listing or given by {owner}), subject, body.
+ Write the body in the language of the person it goes to, as {owner} would, short, signed with {owner}'s name only. After drafting, your reply MUST read out the
+ recipient address, the subject and the complete text, then ask whether to send it. Say it is a draft, never that it was sent.
+ {{"type":"send_email"}} = send the pending draft. ONLY when {owner} says send/yes/go ahead AFTER hearing the draft in an earlier turn, never in the same turn as draft_email.
+ {{"type":"discard_draft"}}
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
@@ -36,6 +42,9 @@ class Brain:
         tasks = self.store.open_tasks()
         if tasks:
             ctx.append("Open tasks: " + "; ".join(f"#{t['id']} {t['text']}" for t in tasks))
+        draft = self.skills.pending_draft()
+        if draft:
+            ctx.append(f"Pending draft, NOT sent yet. To: {draft['to']} | Subject: {draft['subject']} | Text: {draft['body']}")
         ctx.append("VIPs: " + ", ".join(v["name"] for v in self.cfg["screening"]["vip"]))
         ctx.append("Jobs: " + ", ".join(f"{j['name']}({j.get('every') or 'at ' + str(j.get('at'))})" for j in self.cfg["jobs"]))
         try:
@@ -64,7 +73,7 @@ class Brain:
     # whitelisted config changes only - the LLM can never touch anything else
     def apply(self, actions: list) -> str:
         """Runs the whitelisted actions. Returns what to say instead of the LLM's reply if one failed, else ''."""
-        c, changed, failed = self.cfg.data, False, ""
+        c, changed, failed, drafted = self.cfg.data, False, "", False
         for a in actions if isinstance(actions, list) else []:
             if not isinstance(a, dict):
                 continue
@@ -103,6 +112,25 @@ class Brain:
                 except Exception:
                     log.exception("send_whatsapp failed")
                     failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
+            elif t == "draft_email":
+                try:
+                    self.skills.make_draft(a)
+                    drafted = True
+                except Exception as e:
+                    log.exception("draft_email failed")
+                    failed = "I need a proper email address, a subject and some text for that." if isinstance(e, ValueError) \
+                        else "I could not prepare that email."
+            elif t == "send_email":
+                if drafted:                       # a draft is only ever sent after the owner has heard it
+                    failed = "That is only a draft. Tell me to send it once you have heard it."
+                else:
+                    try:
+                        log.info("sent email to %s", self.skills.send_draft())
+                    except Exception:
+                        log.exception("send_email failed")
+                        failed = "I could not send that email. There may be no draft waiting."
+            elif t == "discard_draft":
+                self.store.set("draft", None)
             elif t == "trash_email" and isinstance(a.get("n"), int):
                 try:
                     log.info("trashed email: %s", self.skills.trash_inbox_item(a["n"]))

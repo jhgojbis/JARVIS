@@ -1,6 +1,6 @@
 """What Jarvis can do for you. Each skill is plain Python; the LLM is only used for judgement/wording."""
 from __future__ import annotations
-import threading, time
+import re, threading, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from .config import Config
@@ -102,6 +102,47 @@ class Skills:
         mail.trash(self.cfg, m["id"])
         self._inbox = None                      # the listing has changed
         return m["subject"]
+
+    DRAFT_TTL = 1800        # an unsent draft is forgotten after 30 minutes
+
+    def pending_draft(self) -> dict | None:
+        d = self.store.get("draft")
+        return d if d and time.time() - d["ts"] < self.DRAFT_TTL else None
+
+    def make_draft(self, a: dict) -> dict:
+        """Prepare (never send) an email: a reply to inbox item [n], a forward of it, or a brand-new mail.
+        Kept as the single pending draft and filed in the Gmail drafts folder."""
+        body, to, subject = str(a.get("body", "")).strip()[:3000], str(a.get("to", "")).strip(), str(a.get("subject", "")).strip()[:200]
+        cached = getattr(self, "_inbox", None)
+        items = list(reversed(cached[1])) if cached else []
+        n = a.get("n")
+        src = items[n - 1] if isinstance(n, int) and 1 <= n <= len(items) else None
+        if isinstance(n, int) and src is None:
+            raise LookupError("no such email in the listing")
+        d = {"to": to, "subject": subject, "body": body, "in_reply_to": "", "ts": time.time()}
+        if src and a.get("forward") is not True:                          # reply
+            d.update(to=src["reply_to"], subject=src["subject"] if src["subject"].lower().startswith("re:") else "Re: " + src["subject"],
+                     in_reply_to=src["id"])
+        elif src:                                                         # forward, with the original in full
+            full = mail.fetch_body(self.cfg, src["id"])
+            d["subject"] = src["subject"] if src["subject"].lower().startswith("fwd:") else "Fwd: " + src["subject"]
+            d["body"] = f"{body}\n\n---------- Forwarded message ----------\nFrom: {full['from']}\nSubject: {full['subject']}\n\n{full['snippet']}".strip()
+        if not re.fullmatch(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+", d["to"]) or not d["subject"] or not d["body"].strip():
+            raise ValueError("need a valid recipient address, a subject and some text")
+        self.store.set("draft", d)
+        try:
+            mail.save_draft(self.cfg, d)
+        except Exception:
+            pass                                  # the draft still exists here; the Gmail copy is a convenience
+        return d
+
+    def send_draft(self) -> str:
+        d = self.pending_draft()
+        if not d:
+            raise LookupError("no draft is waiting")
+        mail.send(self.cfg, d)
+        self.store.set("draft", None)
+        return d["to"]
 
     def inbox_recent(self, seconds: float = 300) -> bool:
         """True while a conversation about email is going on, so follow-ups ("and the next one?") keep the inbox."""
