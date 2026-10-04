@@ -18,7 +18,7 @@ def _mail_creds(monkeypatch):
     # tests must never depend on (or reach) the real mailboxes in .env
     monkeypatch.setenv("EMAIL_ADDRESS", "me@example.com")
     monkeypatch.setenv("EMAIL_APP_PASSWORD", "pw")
-    for k in ("MAKLAR_EMAIL_ADDRESS", "MAKLAR_EMAIL_APP_PASSWORD"):
+    for k in ("MAKLAR_EMAIL_ADDRESS", "MAKLAR_EMAIL_APP_PASSWORD", "TELEGRAM_BOT_TOKEN"):
         monkeypatch.delenv(k, raising=False)
 
 

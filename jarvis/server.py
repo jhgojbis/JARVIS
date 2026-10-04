@@ -245,7 +245,7 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
     async def telegram_hook(request: Request):
         if tg is None:
             raise HTTPException(404)
-        if not hmac.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), secret_for(tg_token or getattr(tg, "token", ""))):
+        if not hmac.compare_digest(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), secret_for(getattr(tg, "token", "") or tg_token)):
             raise HTTPException(403, "bad telegram secret")
         update = await request.json()
         uid = int(update.get("update_id", 0))
