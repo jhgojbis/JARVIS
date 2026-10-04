@@ -19,13 +19,48 @@ def fetch_recent(cfg: Config, limit: int = 10, snippet: int = 500) -> list[dict]
     return _fetch(cfg, "ALL", limit, snippet)
 
 
-def _fetch(cfg: Config, criteria: str, limit: int, snippet: int) -> list[dict]:
+def _connect(cfg: Config):
     user, pw = Config.env("EMAIL_ADDRESS"), Config.env("EMAIL_APP_PASSWORD").replace(" ", "")
     if not (user and pw):
         raise RuntimeError("EMAIL_ADDRESS / EMAIL_APP_PASSWORD not set")
     M = imaplib.IMAP4_SSL(cfg["email"]["imap_host"])
+    M.login(user, pw)
+    return M
+
+
+def trash(cfg: Config, message_id: str) -> None:
+    """Move one message to the trash folder (Gmail keeps it 30 days; nothing is ever deleted for good).
+    Found by Message-ID; the folder is whichever one the server flags \\Trash, so it works in any language."""
+    if not message_id.strip("<> "):
+        raise ValueError("no message id")
+    M = _connect(cfg)
     try:
-        M.login(user, pw)
+        M.select("INBOX")
+        _, data = M.search(None, "HEADER", "Message-ID", '"%s"' % message_id.replace('"', ""))
+        nums = data[0].split()
+        if not nums:
+            raise LookupError("message not found in the inbox")
+        folder = None
+        for line in M.list()[1]:
+            text = line.decode() if isinstance(line, bytes) else str(line)
+            if "\\Trash" in text:
+                folder = text.rsplit(' "/" ', 1)[-1].strip().strip('"') if ' "/" ' in text else text.rsplit(" ", 1)[-1].strip('"')
+        if not folder:
+            raise RuntimeError("no trash folder found")
+        for n in nums:
+            M.copy(n, '"%s"' % folder)
+            M.store(n, "+FLAGS", "\\Deleted")
+        M.expunge()
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+def _fetch(cfg: Config, criteria: str, limit: int, snippet: int) -> list[dict]:
+    M = _connect(cfg)
+    try:
         M.select("INBOX", readonly=True)       # readonly: never marks mail as read
         _, data = M.search(None, criteria)
         ids = data[0].split()[-limit:]

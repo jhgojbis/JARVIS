@@ -17,6 +17,8 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  {{"type":"set_screening","enabled":bool}} | {{"type":"set_quiet_hours","start":"HH:MM","end":"HH:MM"}}
  {{"type":"send_whatsapp","text":str,"voice":bool}} = send {owner} a WhatsApp message (only ever to them). Use it when asked to send, forward or
  WhatsApp something. "text" is the COMPLETE message (e.g. the whole summary, in English, max 900 chars), never a placeholder; "voice":true also attaches it as a spoken clip.
+ {{"type":"trash_email","n":int}} = move email [n] of the inbox listing below to the trash (recoverable). Only when {owner} tells you to delete/remove/trash
+ it; no confirmation needed. Pick n by sender/subject; if two emails match, ask which one instead of guessing.
 Confirm what you changed in the reply. If unsure, ask. Never invent facts: use only the context given.
 Return JSON: {{"reply":str,"actions":[...]}}"""
 
@@ -52,16 +54,17 @@ class Brain:
         except Exception:
             return "Sorry, I couldn't reach my brain just now. Try again in a moment."
         reply = str(r.get("reply") or "Sorry, I didn't catch that.")
-        if self.apply(r.get("actions") or []):          # an action failed: never claim it worked
-            reply = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
+        failed = self.apply(r.get("actions") or [])
+        if failed:                                      # an action failed: never claim it worked
+            reply = failed
         self.store.add_history(channel, "user", text)
         self.store.add_history(channel, "assistant", reply)
         return reply
 
     # whitelisted config changes only - the LLM can never touch anything else
-    def apply(self, actions: list) -> bool:
-        """Runs the whitelisted actions. Returns True if a WhatsApp send failed."""
-        c, changed, failed = self.cfg.data, False, False
+    def apply(self, actions: list) -> str:
+        """Runs the whitelisted actions. Returns what to say instead of the LLM's reply if one failed, else ''."""
+        c, changed, failed = self.cfg.data, False, ""
         for a in actions if isinstance(actions, list) else []:
             if not isinstance(a, dict):
                 continue
@@ -99,7 +102,13 @@ class Brain:
                     (self.notifier.voice_clip if a.get("voice") is True else self.notifier.message)(str(a["text"])[:1000])
                 except Exception:
                     log.exception("send_whatsapp failed")
-                    failed = True
+                    failed = "I tried to send that to your WhatsApp, but it was refused. You may need to message me there first."
+            elif t == "trash_email" and isinstance(a.get("n"), int):
+                try:
+                    log.info("trashed email: %s", self.skills.trash_inbox_item(a["n"]))
+                except Exception:
+                    log.exception("trash_email failed")
+                    failed = "I could not move that email to the trash."
         if changed:
             self.cfg.save()
         return failed

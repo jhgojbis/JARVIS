@@ -92,6 +92,17 @@ class Skills:
         return "\n".join(f"[{i + 1}]{' (unread)' if m.get('unread') else ''} From {m['from']} | Subject: {m['subject']} | "
                          f"{m['snippet']}" for i, m in enumerate(reversed(cached[1])))
 
+    def trash_inbox_item(self, n: int) -> str:
+        """Move email [n] of the inbox listing last read out to the trash; returns its subject."""
+        cached = getattr(self, "_inbox", None)
+        items = list(reversed(cached[1])) if cached else []
+        if not 1 <= n <= len(items):
+            raise LookupError("no such email in the listing")
+        m = items[n - 1]
+        mail.trash(self.cfg, m["id"])
+        self._inbox = None                      # the listing has changed
+        return m["subject"]
+
     def inbox_recent(self, seconds: float = 300) -> bool:
         """True while a conversation about email is going on, so follow-ups ("and the next one?") keep the inbox."""
         return bool(getattr(self, "_inbox", None)) and time.time() - self._inbox[0] < seconds

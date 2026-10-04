@@ -438,3 +438,64 @@ def test_whatsapp_status_webhook(tmp_path):
     c = TestClient(create_app(cfg, Store(str(tmp_path / "y.db")), FakeLLM(), n, verify_twilio=False))
     assert c.post("/whatsapp/status", data={"MessageSid": "SM9", "MessageStatus": "undelivered"}).status_code == 204
     assert n.sent == [("SM9", "undelivered")]
+
+
+# ---------------- "delete that email" by voice: moves to the trash, never deletes for good ----------------
+class FakeIMAP:
+    log = []
+
+    def __init__(self, host): FakeIMAP.log = [("connect", host)]
+    def login(self, u, p): FakeIMAP.log.append(("login",))
+    def select(self, box, readonly=False): FakeIMAP.log.append(("select", box, readonly)); return "OK", [b"1"]
+    def search(self, *a): FakeIMAP.log.append(("search",) + a); return "OK", [b"7"]
+    def list(self): return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren \\Trash) "/" "[Gmail]/Papperskorgen"']
+    def copy(self, n, f): FakeIMAP.log.append(("copy", n, f))
+    def store(self, n, how, flag): FakeIMAP.log.append(("store", n, how, flag))
+    def expunge(self): FakeIMAP.log.append(("expunge",))
+    def logout(self): FakeIMAP.log.append(("logout",))
+
+
+def test_trash_copies_to_the_servers_trash_folder_then_removes_from_inbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("EMAIL_ADDRESS", "a@b.c")
+    monkeypatch.setenv("EMAIL_APP_PASSWORD", "pw")
+    monkeypatch.setattr(mailmod.imaplib, "IMAP4_SSL", FakeIMAP)
+    cfg, *_ = make(tmp_path)
+    mailmod.trash(cfg, "<abc@x.se>")
+    log = FakeIMAP.log
+    assert ("select", "INBOX", False) in log                              # writable, unlike every read
+    assert ("search", None, "HEADER", "Message-ID", '"<abc@x.se>"') in log
+    assert ("copy", b"7", '"[Gmail]/Papperskorgen"') in log
+    assert log.index(("copy", b"7", '"[Gmail]/Papperskorgen"')) < log.index(("expunge",)) and ("logout",) in log
+
+
+def test_trash_refuses_an_empty_id(tmp_path):
+    cfg, *_ = make(tmp_path)
+    with pytest.raises(ValueError):
+        mailmod.trash(cfg, "<>")
+
+
+def test_voice_trash_picks_the_numbered_email_from_the_listing(tmp_path, monkeypatch):
+    import time as _t
+    trashed = []
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid: trashed.append(mid))
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    llm = FakeLLM({"reply": "Done, Boss.", "actions": [{"type": "trash_email", "n": 2}]},
+                  {"reply": "Done.", "actions": [{"type": "trash_email", "n": 9}]})
+    sk = Skills(cfg, store, llm)
+    sk._inbox = (_t.time(), MAILS)                    # oldest first, as fetch_recent returns it; listing shows newest first
+    b = Brain(cfg, store, llm, sk, None)
+    assert b.chat("voice", "delete the Anna one") == "Done, Boss."
+    assert trashed == ["<1>"]                         # [2] in the newest-first listing is the older mail
+    assert sk._inbox is None                          # listing is stale after a delete
+    r = b.chat("voice", "delete number nine")
+    assert "could not move" in r and trashed == ["<1>"]
+
+
+def test_voice_trash_failure_is_not_reported_as_done(tmp_path, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(mailmod, "trash", lambda cfg, mid: (_ for _ in ()).throw(OSError("imap down")))
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    llm = FakeLLM({"reply": "Done, Boss.", "actions": [{"type": "trash_email", "n": 1}]})
+    sk = Skills(cfg, store, llm)
+    sk._inbox = (_t.time(), MAILS)
+    assert "could not move" in Brain(cfg, store, llm, sk, None).chat("voice", "delete it")
