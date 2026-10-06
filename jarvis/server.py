@@ -6,7 +6,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
-from . import tts
+from . import receipts, stt, tts
 from .telegram import Telegram, secret_for
 from .brain import Brain
 from .config import Config, norm_number
@@ -192,18 +192,13 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
             text, summary = skills.digest_with_summary()
             if summary:                       # the numbered list goes to your phone before Jarvis starts reading it out
                 try:
-                    notifier.message(summary, buttons=summary_buttons())
+                    notifier.message(summary, buttons=skills.summary_buttons())
                 except Exception:
                     log.exception("could not send the numbered summary")
             store.add_history("voice", "assistant", text)
             return text
         pending[sid] = (asyncio.get_running_loop().run_in_executor(None, run), time.monotonic())
         return await owner_reply(sid, FAST_WAIT, hold="Good day. One moment while I check your mail.")
-
-    def summary_buttons() -> list[list[tuple[str, str]]]:
-        """Telegram buttons under the numbered summary: delete all, or one by number."""
-        n = min(skills.summary_count(), 8)
-        return ([[("Delete all", "del:all")]] + [[(f"Delete {i}", f"del:{i}") for i in range(1, n + 1)]]) if n else []
 
     def tg_trash(which: str) -> str:
         """Button press: deterministic, no LLM. 'all' = every item of the latest summary that is still there."""
@@ -218,6 +213,65 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
             return "I could not move all of those to the trash."
         return "Moved to the trash: " + "; ".join(names)
 
+    def tg_reply_draft(n: int) -> None:
+        """Button "Reply N": write a draft, show it in full and let the owner send or discard it. Nothing leaves without the Send button."""
+        owner = int(cfg["owner"]["telegram_chat_id"])
+        tg.typing(owner)
+        try:
+            d = skills.suggest_reply(n)
+        except Exception:
+            log.exception("reply draft failed")
+            tg.send_message(owner, "I could not write that reply.")
+            return
+        tg.send_message(owner, f"Draft (not sent) from {d['account']}\nTo: {d['to']}\nSubject: {d['subject']}\n\n{d['body']}",
+                        [[("Send", "draft:send"), ("Discard", "draft:discard")]])
+
+    def tg_draft_action(what: str) -> str:
+        if what == "discard":
+            store.set("draft", None)
+            return "Draft discarded."
+        try:
+            return "Sent to " + skills.send_draft()
+        except Exception:
+            log.exception("sending the draft failed")
+            return "I could not send that. There may be no draft waiting (they expire after 30 minutes)."
+
+    def tg_text(owner: int, text: str) -> None:
+        t0 = time.monotonic()
+        tg.typing(owner)
+        reply = brain.chat("telegram", text[:1000])
+        t1 = time.monotonic()
+        tg.send_message(owner, reply)
+        # latest timing, readable from the database: how long the brain took vs the whole turn
+        store.set("tg_timing", {"brain_s": round(t1 - t0, 2), "total_s": round(time.monotonic() - t0, 2), "text": text[:30]})
+
+    def tg_voice(owner: int, file_id: str) -> None:
+        """A voice note: transcribed here (Swedish or English), then handled like typed text."""
+        tg.typing(owner)
+        try:
+            text = stt.transcribe(tg.download(file_id))
+        except Exception:
+            log.exception("voice note failed")
+            tg.send_message(owner, "I could not understand that voice note.")
+            return
+        if not text:
+            tg.send_message(owner, "I heard nothing in that voice note.")
+            return
+        tg.send_message(owner, f"Heard: {text}")
+        tg_text(owner, text)
+
+    def tg_receipt(owner: int, file_id: str, media_type: str) -> None:
+        tg.typing(owner)
+        try:
+            image = tg.download(file_id)
+            d = receipts.read(image, media_type)
+            receipts.save(d, image)
+        except Exception:
+            log.exception("receipt failed")
+            tg.send_message(owner, "I could not read that receipt. Try a sharper, straight-on photo.")
+            return
+        tg.send_message(owner, "Logged (draft for the bookkeeping, check it against the receipt):\n" + receipts.describe(d))
+
     def tg_handle(update: dict) -> None:
         owner = int(cfg["owner"].get("telegram_chat_id") or 0)
         cb, msg = update.get("callback_query"), update.get("message") or {}
@@ -230,14 +284,18 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
                 data = str(cb.get("data", ""))
                 if data == "del:all" or re.fullmatch(r"del:\d{1,2}", data):
                     tg.send_message(owner, tg_trash(data.split(":")[1]))
+                elif re.fullmatch(r"rep:\d{1,2}", data):
+                    tg_reply_draft(int(data.split(":")[1]))
+                elif data in ("draft:send", "draft:discard"):
+                    tg.send_message(owner, tg_draft_action(data.split(":")[1]))
+            elif msg.get("voice") or msg.get("audio"):
+                tg_voice(owner, (msg.get("voice") or msg["audio"])["file_id"])
+            elif msg.get("photo"):
+                tg_receipt(owner, msg["photo"][-1]["file_id"], "image/jpeg")           # the largest size Telegram made
+            elif str((msg.get("document") or {}).get("mime_type", "")).startswith("image/"):
+                tg_receipt(owner, msg["document"]["file_id"], msg["document"]["mime_type"])
             elif str(msg.get("text", "")).strip():
-                t0 = time.monotonic()
-                tg.typing(owner)
-                reply = brain.chat("telegram", str(msg["text"])[:1000])
-                t1 = time.monotonic()
-                tg.send_message(owner, reply)
-                # latest timing, readable from the database: how long the brain took vs the whole turn
-                store.set("tg_timing", {"brain_s": round(t1 - t0, 2), "total_s": round(time.monotonic() - t0, 2), "text": str(msg["text"])[:30]})
+                tg_text(owner, str(msg["text"]))
         except Exception:
             log.exception("telegram update failed")
 

@@ -56,6 +56,27 @@ class WarmClaude:
 _warm = WarmClaude()
 
 
+def ask_image(prompt: str, image: bytes, media_type: str = "image/jpeg", model: str = "sonnet", timeout: float = 120) -> str:
+    """One-off `claude -p` call that looks at an image (a receipt). Slower than the warm Haiku, but reads numbers properly."""
+    import base64
+    args = [a if a != "haiku" else model for a in WarmClaude.ARGS]
+    msg = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(image).decode()}},
+        {"type": "text", "text": prompt}]}}
+    out = subprocess.run(args, input=json.dumps(msg) + "\n", capture_output=True, text=True, timeout=timeout,
+                         env={**os.environ, "MAX_THINKING_TOKENS": "0"}).stdout
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "result":
+            if ev.get("is_error"):
+                raise RuntimeError(f"claude CLI failed: {str(ev.get('result'))[:200]}")
+            return str(ev.get("result") or "").strip()
+    raise RuntimeError("claude CLI gave no result")
+
+
 class LLM:
     def __init__(self, cfg: Config, store: Store):
         self.cfg, self.store = cfg, store

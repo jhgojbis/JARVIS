@@ -8,3 +8,5 @@ jarvis.db
 .venv/
 audio/
 models/
+
+receipts/

@@ -10,6 +10,7 @@ dependencies = [
 ]
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]
+voice = ["faster-whisper>=1.0", "numpy"]   # Telegram voice notes (needs ffmpeg on PATH)
 kokoro = ["kokoro-onnx>=0.4", "lameenc>=1.7", "soundfile"]
 [project.scripts]
 jarvis = "jarvis.cli:main"

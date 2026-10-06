@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 DEFAULTS = {
-    "owner": {"name": "Boss", "phone": "", "whatsapp": "", "telegram_chat_id": 0, "timezone": "UTC", "quiet_hours": ["22:00", "07:00"]},
+    "owner": {"name": "Boss", "signature": "", "phone": "", "whatsapp": "", "telegram_chat_id": 0, "timezone": "UTC", "quiet_hours": ["22:00", "07:00"]},
     "voice": {"twilio_voice": "Polly.Brian-Neural", "language": "en-GB", "assistant_name": "Jarvis",
               "engine": "polly"},   # polly (Twilio <Say>) | thomas | luke (edge-tts, played with <Play>)
     # Jarvis only phones inside this window; outside it (or when you don't pick up) you get a WhatsApp voice clip instead.
@@ -16,6 +16,8 @@ DEFAULTS = {
     "screening": {"enabled": True, "vip": [], "block_unknown_spam": True, "allow_urgent": True,
                   "greeting": "Hello, this is {assistant}, {owner}'s assistant. Who is calling, and what is it about?"},
     "email": {"enabled": False, "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com", "important_senders": [], "ignore_senders": [], "accounts": []},
+    # lead notification mails (e.g. Meta "new lead") are spotted in the high-priority mailbox every few minutes and reported at once
+    "leads": {"senders": ["facebookmail.com"], "subject_words": ["lead", "förfrågan", "forfragan"]},
     "calendar": {"enabled": False, "ics_urls": []},
     "jobs": [],
 }

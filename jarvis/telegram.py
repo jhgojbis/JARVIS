@@ -38,6 +38,15 @@ class Telegram:
         if not r.json().get("ok"):
             raise RuntimeError(f"telegram sendAudio: {r.json().get('description', r.status_code)}")
 
+    def download(self, file_id: str, max_bytes: int = 20_000_000) -> bytes:
+        """A file (voice note, photo) the owner sent. Bot API limit is 20 MB."""
+        info = self.call("getFile", file_id=file_id)
+        if int(info.get("file_size") or 0) > max_bytes:
+            raise ValueError("file too large")
+        r = requests.get(f"https://api.telegram.org/file/bot{self.token}/{info['file_path']}", timeout=60)
+        r.raise_for_status()
+        return r.content
+
     def typing(self, chat_id: int) -> None:
         try:
             self.call("sendChatAction", timeout=5, chat_id=chat_id, action="typing")

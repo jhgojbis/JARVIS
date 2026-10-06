@@ -1,4 +1,4 @@
-import json
+import json, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
@@ -1041,6 +1041,7 @@ class FakeTelegram:
     def typing(self, chat): self.out.append(("typing", chat))
     def answer_callback(self, cid): self.out.append(("ack", cid))
     def set_webhook(self, url): self.out.append(("webhook", url))
+    def download(self, file_id): return b"bytes-of-" + file_id.encode()
 
 
 OWNER_TG = 4242
@@ -1116,7 +1117,8 @@ def test_summary_goes_to_telegram_with_delete_buttons_and_buttons_delete(tmp_pat
         c.post("/voice/incoming", data={"From": "+15551112222", "CallSid": "CA1"})
     kind, chat, text, buttons = next(o for o in tg.out if o[0] == "msg")
     assert chat == OWNER_TG and text.startswith("3 emails need you:")
-    assert buttons == [[("Delete all", "del:all")], [("Delete 1", "del:1"), ("Delete 2", "del:2"), ("Delete 3", "del:3")]]
+    assert buttons == [[("Delete all", "del:all")], [("Delete 1", "del:1"), ("Delete 2", "del:2"), ("Delete 3", "del:3")],
+                       [("Reply 1", "rep:1"), ("Reply 2", "rep:2"), ("Reply 3", "rep:3")]]
     post(c, {"update_id": 20, "callback_query": {"id": "cb1", "from": {"id": OWNER_TG}, "data": "del:2"}})
     assert trashed == ["<2>"] and ("ack", "cb1") in tg.out
     post(c, {"update_id": 21, "callback_query": {"id": "cb2", "from": {"id": OWNER_TG}, "data": "del:all"}})
@@ -1141,3 +1143,88 @@ def test_owner_calls_listen_in_their_own_language():
     cfg = Config(_merge(DEFAULTS, {"voice": {"listen_language": "sv-SE"}}))
     xml = say_and_listen(cfg, "Hello", "/x")
     assert 'Gather input="speech"' in xml and 'language="sv-SE"' in xml
+
+
+# ---------------- leads, reply drafts, voice notes, receipts ----------------
+WORK = {"name": "Work", "user": "w@x.se", "pw": "p", "priority": "high", "unread_only": True, "imap": "i", "smtp": "s"}
+LEAD = {"id": "<l1>", "from": "Facebook <notification@facebookmail.com>", "subject": "New lead: Anna", "snippet": "Anna, 070-1", "reply_to": "n@x.se"}
+NOISE = {"id": "<n1>", "from": "Brevo <a@brevo.com>", "subject": "Your newsletter", "snippet": "hi", "reply_to": "a@brevo.com"}
+
+
+def test_lead_mail_is_reported_once(tmp_path, monkeypatch):
+    from jarvis.skills import Skills
+    monkeypatch.setattr(mailmod, "accounts", lambda cfg: [WORK])
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: [dict(LEAD), dict(NOISE)])
+    cfg, store, _, _ = make(tmp_path, email={"enabled": True})
+    sk = Skills(cfg, store, FakeLLM())
+    first = sk.lead_mail()
+    assert [m["id"] for m in first] == ["<l1>"] and first[0]["account"] == "Work"
+    assert sk.lead_mail() == []                                   # already told the owner
+
+
+def test_lead_check_job_alerts_and_sends_buttons(tmp_path, monkeypatch):
+    from jarvis.scheduler import Scheduler
+    from jarvis.skills import Skills
+    monkeypatch.setattr(mailmod, "accounts", lambda cfg: [WORK])
+    monkeypatch.setattr(mailmod, "fetch_unread", lambda cfg, *a, **k: [dict(LEAD)])
+    cfg, store, n, _ = make(tmp_path, email={"enabled": True}, jobs=[{"name": "lead_check", "action": "lead_check", "every": "5m", "notify": "alert"}])
+    sent = []
+    n.message = lambda t, **k: sent.append((t, k.get("buttons")))
+    sk = Skills(cfg, store, FakeLLM())
+    out = Scheduler(cfg, store, sk, n).tick(datetime(2026, 10, 6, 14, 0, tzinfo=ZoneInfo("Europe/Stockholm")))
+    assert len(out) == 1 and "New lead" in out[0] and n.sent[0][0] == "alert"
+    assert "Reply 1" in str(sent[0][1])
+
+
+def test_reply_button_drafts_and_send_button_sends(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(mailmod, "send", lambda cfg, d: sent.append(d))
+    monkeypatch.setattr(mailmod, "save_draft", lambda cfg, d: None)
+    monkeypatch.setattr(mailmod, "accounts", lambda cfg: [WORK])
+    llm = FakeLLM({"body": "Hej Anna, tack! Jag återkommer."})
+    cfg, store, tg, c, app = tg_app(tmp_path, llm=llm, email={"enabled": True})
+    app.state.brain.skills.set_numbered([dict(LEAD, account="Work", unread=True, why="lead")])
+    post(c, {"update_id": 1, "callback_query": {"id": "r1", "from": {"id": OWNER_TG}, "data": "rep:1"}})
+    kind, chat, text, buttons = next(o for o in tg.out if o[0] == "msg")
+    assert "Draft (not sent)" in text and "Hej Anna" in text and buttons == [[("Send", "draft:send"), ("Discard", "draft:discard")]]
+    assert sent == []                                              # nothing leaves before Send
+    post(c, {"update_id": 2, "callback_query": {"id": "r2", "from": {"id": OWNER_TG}, "data": "draft:send"}})
+    assert len(sent) == 1 and sent[0]["to"] == "n@x.se" and tg.out[-1][2].startswith("Sent to")
+
+
+def test_discard_button_forgets_the_draft(tmp_path):
+    cfg, store, tg, c, app = tg_app(tmp_path)
+    store.set("draft", {"to": "a@b.se", "subject": "s", "body": "b", "ts": time.time(), "account": "Work", "in_reply_to": ""})
+    post(c, {"update_id": 1, "callback_query": {"id": "r1", "from": {"id": OWNER_TG}, "data": "draft:discard"}})
+    assert store.get("draft") is None and tg.out[-1][2] == "Draft discarded."
+
+
+def test_voice_note_is_transcribed_and_answered(tmp_path, monkeypatch):
+    from jarvis import stt
+    monkeypatch.setattr(stt, "transcribe", lambda audio: "vad är klockan")
+    cfg, store, tg, c, _ = tg_app(tmp_path, llm=FakeLLM({"reply": "Time to get a watch.", "actions": []}))
+    post(c, {"update_id": 1, "message": {"from": {"id": OWNER_TG}, "voice": {"file_id": "v1"}}})
+    texts = [o[2] for o in tg.out if o[0] == "msg"]
+    assert texts == ["Heard: vad är klockan", "Time to get a watch."]
+
+
+def test_receipt_photo_is_logged(tmp_path, monkeypatch):
+    from jarvis import receipts
+    monkeypatch.setattr(receipts, "DIR", tmp_path / "rc")
+    monkeypatch.setattr(receipts, "ask_image", lambda *a, **k: 'ok {"date":"2026-10-05","vendor":"Fly.io","total":249.5,"vat":49.9,"vat_rate":25,"currency":"SEK","category":"Programvara","note":"hosting"}')
+    cfg, store, tg, c, _ = tg_app(tmp_path)
+    post(c, {"update_id": 1, "message": {"from": {"id": OWNER_TG}, "photo": [{"file_id": "small"}, {"file_id": "big"}]}})
+    assert "Fly.io: 249.5 SEK" in tg.out[-1][2]
+    rows = (tmp_path / "rc" / "receipts.csv").read_text().splitlines()
+    assert len(rows) == 2 and "Fly.io" in rows[1]
+    post(c, {"update_id": 2, "message": {"from": {"id": OWNER_TG}, "photo": [{"file_id": "big"}]}})      # same photo again: no double entry
+    assert len((tmp_path / "rc" / "receipts.csv").read_text().splitlines()) == 2
+
+
+def test_unreadable_receipt_says_so(tmp_path, monkeypatch):
+    from jarvis import receipts
+    monkeypatch.setattr(receipts, "DIR", tmp_path / "rc")
+    monkeypatch.setattr(receipts, "ask_image", lambda *a, **k: "I cannot read it")
+    cfg, store, tg, c, _ = tg_app(tmp_path)
+    post(c, {"update_id": 1, "message": {"from": {"id": OWNER_TG}, "photo": [{"file_id": "x"}]}})
+    assert "could not read that receipt" in tg.out[-1][2]

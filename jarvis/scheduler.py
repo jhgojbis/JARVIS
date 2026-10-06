@@ -42,6 +42,12 @@ class Scheduler:
             n = len(items)
             self.skills.set_numbered(items)            # "delete 1" / "reply 2" on the phone or WhatsApp now mean these
             return f"{self.cfg['owner']['name']}, {n} email{'s need' if n > 1 else ' needs'} you. " + self.skills.say_items(items)
+        if a == "lead_check":
+            items = self.skills.lead_mail()
+            if not items:
+                return None
+            self.skills.set_numbered(items)
+            return f"New lead{'s' if len(items) > 1 else ''}, {self.cfg['owner']['name']}. " + self.skills.say_items(items)
         if a == "calendar_alert":
             return " | ".join(self.skills.calendar_alerts()) or None
         if a == "briefing":
@@ -64,6 +70,9 @@ class Scheduler:
                 if text:
                     self.notifier.send(job.get("notify") if job.get("notify") in ("call", "alert") else "message", text)
                     sent.append(text)
+                    if job["action"] in ("email_check", "lead_check"):      # the numbered list with buttons: delete / draft a reply
+                        items = self.skills.numbered()[:self.skills.summary_count()]
+                        self.notifier.message(self.skills.summary_message(items), buttons=self.skills.summary_buttons())
             except Exception:
                 log.exception("job %s failed", job.get("name"))
         return sent

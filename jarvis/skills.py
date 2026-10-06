@@ -104,6 +104,52 @@ class Skills:
             self.store.set("seen_mail", list(seen | {key(m) for m in new})[-500:])
         return [dict(new[i], why=hits[i]) for i in sorted(hits)]
 
+    def lead_mail(self) -> list[dict]:
+        """New lead notifications (sender or subject matching config `leads`) in the high-priority mailbox, each reported once.
+        Unread mail only; read-only fetch, so nothing is marked as read."""
+        c = self.cfg["leads"]
+        senders, words = [x.lower() for x in c.get("senders") or []], [x.lower() for x in c.get("subject_words") or []]
+        accts = [a["name"] for a in self._accounts() if a["priority"] == "high"]
+        if not accts or not (senders or words):
+            return []
+        seen = set(self.store.get("seen_leads", []))
+        found = []
+        for name in accts:
+            for m in mail.fetch_unread(self.cfg, limit=15, snippet=600, account=name):
+                k = f"{name}|{m['id']}"
+                if k in seen or not (any(x in m["from"].lower() for x in senders) or any(w in m["subject"].lower() for w in words)):
+                    continue
+                found.append(dict(m, account=name, why="new lead: " + (m["subject"] or m["snippet"][:80])[:100]))
+                seen.add(k)
+        self.store.set("seen_leads", list(seen)[-500:])
+        return found
+
+    def suggest_reply(self, n: int) -> dict:
+        """Write a short reply to numbered email [n] and keep it as the pending draft (never sent here)."""
+        items = self.numbered()
+        if not (1 <= n <= len(items)) or items[n - 1].get("gone"):
+            raise LookupError("no such email in the list")
+        m = items[n - 1]
+        sign = self.cfg["owner"].get("signature") or ""
+        r = self.llm.ask_json(
+            "Write a short, polite reply to this email for the owner, in the language of the email, as they would write it: "
+            "plain text, a few sentences, answering what is asked and proposing the obvious next step. Do not invent facts, prices, "
+            "dates or promises; if something is needed from the owner, leave a short [bracketed] placeholder. "
+            + (f"Sign with: {sign}. " if sign else "No sign-off name. ") + 'Return {"body":str}.',
+            f"From: {m['from']}\nSubject: {m['subject']}\n\n{m['snippet']}", 500)
+        body = str(r.get("body") or "").strip()
+        if not body:
+            raise RuntimeError("no reply text came back")
+        return self.make_draft({"n": n, "body": body})
+
+    def summary_buttons(self) -> list[list[tuple[str, str]]]:
+        """Telegram buttons under the numbered summary: delete all / by number, and draft a reply by number."""
+        n = min(self.summary_count(), 8)
+        if not n:
+            return []
+        return [[("Delete all", "del:all")], [(f"Delete {i}", f"del:{i}") for i in range(1, n + 1)],
+                [(f"Reply {i}", f"rep:{i}") for i in range(1, n + 1)]]
+
     def email_text(self, items: list[dict]) -> str:
         multi = len(self._accounts()) > 1
         return "; ".join(f"{m['account'] + ', ' if multi and m.get('account') else ''}{m['from'].split('<')[0].strip()}: "
