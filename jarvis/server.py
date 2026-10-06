@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from . import receipts, stt, tts
+from .connectors import lights
 from .telegram import Telegram, secret_for
 from .brain import Brain
 from .config import Config, norm_number
@@ -56,6 +57,15 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
                 except Exception:
                     log.exception("could not register the Telegram webhook")
             threading.Thread(target=register, daemon=True).start()
+        if not testing and cfg["lights"]["enabled"]:     # reading the gateway takes ~15 s: keep the lamp layout warm in the background
+            def keep_warm():
+                while True:
+                    try:
+                        lights.devices(cfg, fresh=True)
+                    except Exception:
+                        log.exception("could not read the lights")
+                    time.sleep(lights.TTL - 60)
+            threading.Thread(target=keep_warm, daemon=True).start()
         task = None if testing else asyncio.create_task(sched.loop())
         yield
         if task:

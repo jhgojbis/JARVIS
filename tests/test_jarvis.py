@@ -1228,3 +1228,45 @@ def test_unreadable_receipt_says_so(tmp_path, monkeypatch):
     cfg, store, tg, c, _ = tg_app(tmp_path)
     post(c, {"update_id": 1, "message": {"from": {"id": OWNER_TG}, "photo": [{"file_id": "x"}]}})
     assert "could not read that receipt" in tg.out[-1][2]
+
+
+def test_lights_pick_and_dim(monkeypatch):
+    from jarvis.connectors import lights
+    cfg = Config(_merge(DEFAULTS, {"lights": {"enabled": True, "host": "1.2.3.4"}}))
+    tree = {"15004": [1, 2], "15004/2": {"9001": "SuperGroup", "9018": {"15002": {"9003": [10, 11]}}}, "15004/1": {"9001": "Living room", "9018": {"15002": {"9003": [10]}}},
+            "15001": [10, 11, 12],
+            "15001/10": {"9001": "Window", "9019": 1, "3311": [{"5850": 0, "5851": 127}]},
+            "15001/11": {"9001": "Bed", "9019": 0, "3311": [{"5850": 1}]},
+            "15001/12": {"9001": "Remote", "9019": 1}}
+    puts, reads = [], []
+    lights._cache.update(at=0.0, lights=[])
+
+    def fake(method, host, path, user, key, body=None):
+        if method == "get":
+            reads.append(path)
+        if method == "put":
+            puts.append((path, body))
+            return ""
+        return tree[path]
+    monkeypatch.setattr(lights, "_coap", fake)
+    assert lights.set_lights(cfg, "living", brightness=30) == ["Window"]
+    assert puts == [("15001/10", {"3311": [{"5851": 76, "5850": 1}]})]
+    puts.clear()
+    assert lights.set_lights(cfg, "all", on=False) == ["Window"]        # Bed is offline and skipped
+    assert puts == [("15001/10", {"3311": [{"5850": 0}]})]
+    with pytest.raises(LookupError):
+        lights.set_lights(cfg, "garage", on=True)
+    n = len(reads)
+    assert lights.status_text(cfg) == "Living room: Window (off); no room: Bed (on, offline)"
+    assert len(reads) == n                       # served from the remembered layout, the gateway is not asked again
+
+
+def test_brain_lights_action(tmp_path, monkeypatch):
+    from jarvis.connectors import lights
+    calls = []
+    monkeypatch.setattr(lights, "set_lights", lambda cfg, t, on=None, brightness=None: calls.append((t, on, brightness)) or [t])
+    monkeypatch.setattr(lights, "status_text", lambda cfg: "Bedroom: Bed (on)")
+    cfg, store, n, _ = make(tmp_path, lights={"enabled": True, "host": "1.2.3.4"})
+    llm = FakeLLM({"reply": "Done.", "actions": [{"type": "lights", "target": "bedroom", "on": True, "brightness": 40}]})
+    assert Brain(cfg, store, llm, create_app(cfg, store, llm, n, verify_twilio=False).state.brain.skills, n).chat("t", "dim the bedroom light to 40") == "Done."
+    assert calls == [("bedroom", True, 40)] and "Bedroom: Bed (on)" in llm.calls[0][0]

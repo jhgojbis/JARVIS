@@ -19,6 +19,7 @@ DEFAULTS = {
     # lead notification mails (e.g. Meta "new lead") are spotted in the high-priority mailbox every few minutes and reported at once
     "leads": {"senders": ["facebookmail.com"], "subject_words": ["lead", "förfrågan", "forfragan"]},
     "calendar": {"enabled": False, "ics_urls": []},
+    "lights": {"enabled": False, "host": ""},     # IKEA Trådfri Gateway on the LAN; key in .env as TRADFRI_KEY (`jarvis lights-pair`)
     "jobs": [],
 }
 

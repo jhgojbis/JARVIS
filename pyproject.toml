@@ -20,6 +20,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["jarvis"]
 [tool.setuptools.package-data]
-jarvis = ["web/*.html"]
+jarvis = ["web/*.html", "connectors/*.cnf"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]

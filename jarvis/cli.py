@@ -85,15 +85,32 @@ def telegram_id():
         print(f"id={uid}  name={first}  username=@{user}  last message: {text!r}")
 
 
+def lights_pair():
+    """One-time pairing with the IKEA Trådfri Gateway; saves the key in .env and enables lights in config.yaml."""
+    from .connectors import lights
+    cfg = Config.load()
+    host = ask("Gateway IP address", cfg["lights"]["host"] or "192.168.1.66")
+    key = lights.pair(host, ask("Security Code (16 characters, on the underside of the gateway)").replace(" ", ""))
+    with open(".env", "a") as f:
+        f.write(f"\nTRADFRI_KEY={key}\n")
+    cfg.data["lights"].update(enabled=True, host=host)
+    cfg.path = "config.yaml"
+    cfg.save()
+    os.environ["TRADFRI_KEY"] = key
+    print("Paired. Lights found:", lights.status_text(cfg))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="jarvis")
-    p.add_argument("cmd", choices=["setup", "run", "chat", "doctor", "telegram-id"])
+    p.add_argument("cmd", choices=["setup", "run", "chat", "doctor", "telegram-id", "lights-pair"])
     p.add_argument("--port", type=int, default=8080)
     a = p.parse_args(argv)
     if a.cmd == "setup":
         return setup()
     if a.cmd == "doctor":
         return doctor()
+    if a.cmd == "lights-pair":
+        return lights_pair()
     if a.cmd == "telegram-id":
         return telegram_id()
     cfg = Config.load()

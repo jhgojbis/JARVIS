@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging, re
 from . import errands
+from .connectors import lights
 from .config import Config, norm_number
 from .llm import LLM, BudgetExceeded
 from .skills import Skills
@@ -31,6 +32,8 @@ You can configure yourself when asked. Put changes in "actions" (only these type
  {{"type":"call_me"}} = phone {owner} right now (when asked to call/ring them). Reply with one short sentence like "Ringing you now."
  {{"type":"find_places","request":str}} = research restaurants/places on the web in the background and message {owner} the options with map and Uber Eats links.
  Use it for "find me a good restaurant in X". Reply at once with one short sentence like "On it, I'll message you the options in a minute." Never list places yourself.
+ {{"type":"lights","target":str,"on":bool,"brightness":int}} = switch or dim the IKEA lights. target = a room or lamp name from the light list below, or "all".
+ "on" and "brightness" (1-100) are each optional. Say what you did in one short sentence; never claim it worked if no light list is given below.
  {{"type":"add_favorite","item":str}} | {{"type":"remove_favorite","item":str}} = {owner}'s favourite groceries (Swedish item names, e.g. "havregryn")
  {{"type":"send_groceries","items":[str]}} = message {owner} Hemköp links for the items (default: all favourites). You cannot fill the cart, order or pay: say so if asked.
 Never ask which mailbox: every mailbox is already in the numbered list. When asked to check or read email, use the list; do not ask what to check.
@@ -39,6 +42,7 @@ Return JSON: {{"reply":str,"actions":[...]}}"""
 
 log = logging.getLogger("jarvis.brain")
 EMAIL_WORDS = re.compile(r"\b(e-?mails?|inbox|mail|read|said|says|write|writes|wrote|written|sent|messages?)\b", re.I)
+LIGHT_WORDS = re.compile(r"\b(lights?|lamps?|lamp|dim|bright|brighter|darker|lampor|lampan|ljus|tänd|släck|tand|slack)\b", re.I)
 CAL_WORDS = re.compile(r"\b(calendar|schedule|meeting|meetings|today|tomorrow|agenda|busy|free)\b", re.I)
 
 
@@ -69,6 +73,8 @@ class Brain:
                     ctx.append("Numbered emails (all mailboxes):\n" + (self.skills.numbered_text() or "empty"))
             if CAL_WORDS.search(text) and self.cfg["calendar"]["enabled"]:
                 ctx.append("Calendar next 48h: " + (self.skills.calendar_text(48) or "nothing"))
+            if LIGHT_WORDS.search(text) and self.cfg["lights"]["enabled"]:
+                ctx.append("Lights by room: " + lights.status_text(self.cfg))
         except Exception as e:
             ctx.append(f"(a connector failed: {type(e).__name__})")
         system = SYSTEM.format(name=self.cfg["voice"]["assistant_name"], owner=self.cfg["owner"]["name"]) + "\n" + "\n".join(ctx)
@@ -157,6 +163,17 @@ class Brain:
                     failed = "I tried to ring you, but the call was refused."
             elif t == "find_places" and a.get("request") and self.notifier is not None:
                 errands.run_async(errands.places_job, self.cfg, self.notifier, str(a["request"])[:200])
+            elif t == "lights" and self.cfg["lights"]["enabled"]:
+                try:
+                    b = a.get("brightness")
+                    log.info("lights %s: %s", a.get("target"), lights.set_lights(
+                        self.cfg, str(a.get("target") or "all"), a["on"] if isinstance(a.get("on"), bool) else None,
+                        b if isinstance(b, int) and not isinstance(b, bool) else None))
+                except LookupError:
+                    failed = "I couldn't find a light by that name."
+                except Exception:
+                    log.exception("lights failed")
+                    failed = "I couldn't reach the lights just now."
             elif t == "add_favorite" and a.get("item"):
                 favs = self.store.get("favorites", [])
                 item = str(a["item"]).strip()[:60]

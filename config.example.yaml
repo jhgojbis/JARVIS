@@ -40,3 +40,7 @@ jobs:                          # the scheduler; you can change these by talking 
   - {name: email_check,     action: email_check,     every: "3h",    notify: whatsapp}
   - {name: morning_briefing, action: briefing,        at: "08:00",   notify: call}
   - {name: calendar_alert,  action: calendar_alert,  every: "15m",   notify: whatsapp}
+
+lights:                        # IKEA Trådfri Gateway on your home network (needs `brew install libcoap`); run `jarvis lights-pair` once
+  enabled: false
+  host: ""
