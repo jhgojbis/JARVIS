@@ -841,11 +841,14 @@ def test_strangers_are_not_called_back_and_callback_can_be_switched_off(tmp_path
     assert "<Reject" not in off.post("/voice/incoming", data={"From": "+15551112222"}).text
 
 
-def test_answered_callback_opens_with_the_digest(tmp_path, monkeypatch):
-    c = callback_client(tmp_path, monkeypatch)
+def test_answered_callback_only_asks_what_you_want(tmp_path, monkeypatch):
+    def no_mail(*a, **k): raise AssertionError("the call-back must not touch the mailbox")
+    monkeypatch.setattr(mailmod, "fetch_unread", no_mail)
+    monkeypatch.setattr(mailmod, "fetch_recent", no_mail)
+    c = callback_client(tmp_path, monkeypatch, email={"enabled": True})
     with c:
         r = c.post("/voice/owner_start", data={"CallSid": "CA77"}).text
-    assert "Good day, Sam" in r and "/voice/owner" in r
+    assert "Good day, Sam" in r and "What can I do for you" in r and "/voice/owner" in r and "check your mail" not in r
 
 
 def test_notifier_callback_fetches_twiml_from_owner_start(alerts):

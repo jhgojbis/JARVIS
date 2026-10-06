@@ -325,9 +325,9 @@ def create_app(cfg: Config, store: Store | None = None, llm: LLM | None = None,
 
     @app.post("/voice/owner_start")
     async def owner_start(request: Request):
-        """The call-back Jarvis placed to the owner was answered: same opening as when the owner phones in."""
-        f = await check_twilio(request)
-        return await owner_digest(f.get("CallSid", ""))
+        """The call-back Jarvis placed to the owner was answered: just ask what they want, no mail digest."""
+        await check_twilio(request)
+        return xml(say_and_listen(cfg, f"Good day, {cfg['owner']['name']}. What can I do for you?", url("/voice/owner")))
 
     @app.post("/voice/call_status")
     async def call_status(request: Request):

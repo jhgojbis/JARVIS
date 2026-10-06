@@ -95,7 +95,7 @@ class Notifier:
         return c.sid
 
     def callback(self) -> str:
-        """Ring the owner back; the call opens with the same mail digest as when the owner phones in."""
+        """Ring the owner back; the call just asks what the owner wants (no mail digest)."""
         base = Config.env("PUBLIC_URL").rstrip("/")
         return self.client.calls.create(from_=Config.env("TWILIO_NUMBER"), to=norm_number(self.cfg["owner"]["phone"]),
                                         url=f"{base}/voice/owner_start", method="POST").sid
